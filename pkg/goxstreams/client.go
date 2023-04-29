@@ -13,40 +13,29 @@ type Converter[E any] interface {
 }
 
 type StreamClient[E any] struct {
-	client  *redis.Client
-	streams []string
-	group   string
-
+	client        *redis.Client
 	groupReadArgs *redis.XReadGroupArgs
-
-	converter Converter[E]
+	converter     Converter[E]
 }
 
 type Params struct {
-	Streams  []string
+	Stream   string
 	Group    string
 	Consumer string
 	Batch    int64
 }
 
 func NewClient[E any](client *redis.Client, params Params, converter Converter[E]) StreamClient[E] {
-	streamsVal := make([]string, len(params.Streams)*2)
-	for i := 0; i < len(params.Streams); i++ {
-		streamsVal[i] = params.Streams[i]
-		streamsVal[len(params.Streams)-i] = ">"
-	}
-
 	groupReadArgs := &redis.XReadGroupArgs{
-		Streams:  params.Streams,
+		Streams:  []string{params.Stream, ">"},
 		Group:    params.Group,
 		Consumer: params.Consumer,
 		Count:    params.Batch,
-	} //NoAck: true
+		NoAck:    true,
+	}
 
 	streamClient := StreamClient[E]{
 		client:        client,
-		streams:       streamsVal,
-		group:         params.Group,
 		groupReadArgs: groupReadArgs,
 		converter:     converter,
 	}
@@ -60,29 +49,23 @@ func (c StreamClient[E]) Add(ctx context.Context, stream string, event E) error 
 	return err
 }
 
-func (c StreamClient[E]) GroupRead(ctx context.Context) (map[string][]E, error) {
+func (c StreamClient[E]) ReadGroup(ctx context.Context) ([]E, error) {
 	streams, err := c.client.XReadGroup(ctx, c.groupReadArgs).Result()
 	if err != nil {
 		return nil, err
 	}
 
-	result := make(map[string][]E)
-	for _, stream := range streams {
-		var events []E
-
-		for _, event := range stream.Messages {
-			convertedEvent, err := c.converter.To(event.ID, event.Values)
-			if err != nil {
-				log.Printf("%v", err)
-			}
-
+	events := make([]E, 0, len(streams[0].Messages))
+	for _, event := range streams[0].Messages {
+		convertedEvent, err := c.converter.To(event.ID, event.Values)
+		if err != nil {
+			log.Printf("converter error %w\n", err)
+		} else {
 			events = append(events, convertedEvent)
 		}
-
-		result[stream.Stream] = events
 	}
 
-	return result, nil
+	return events, nil
 }
 
 func (c StreamClient[E]) Pending() {

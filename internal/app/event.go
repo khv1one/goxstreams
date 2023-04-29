@@ -1,6 +1,9 @@
 package app
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 type Event struct {
 	RedisID string
@@ -27,22 +30,30 @@ func (c Converter[E]) To(id string, event map[string]interface{}) (Event, error)
 	result := Event{}
 	message, ok := event["message"].(string)
 	if !ok {
-		return result, errors.New("error convert to EventStruct, message dont exist")
+		return result, errors.New("error convert to EventStruct, message is not exist")
 	}
 
 	name, ok := event["name"].(string)
 	if !ok {
-		return result, errors.New("error convert to EventStruct, name dont exist")
+		return result, errors.New("error convert to EventStruct, name is not exist")
 	}
 
-	foo, ok := event["foo"].(int)
+	fooStr, ok := event["foo"].(string)
 	if !ok {
-		return result, errors.New("error convert to EventStruct, foo dont exist")
+		return result, errors.New("error convert to EventStruct, foo is not exist")
+	}
+	foo, err := strconv.Atoi(fooStr)
+	if err != nil {
+		return result, err
 	}
 
-	bar, ok := event["bar"].(int)
+	barStr, ok := event["bar"].(string)
 	if !ok {
-		return result, errors.New("error convert to EventStruct, bar dont exist")
+		return result, errors.New("error convert to EventStruct, bar is not exist")
+	}
+	bar, err := strconv.Atoi(barStr)
+	if err != nil {
+		return result, err
 	}
 
 	result.RedisID = id
