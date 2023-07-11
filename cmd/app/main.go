@@ -18,10 +18,10 @@ func main() {
 	converter := app.Converter[app.Event]{}
 	streamClient := streamClientInit(ctx, converter)
 
-	consumer := consumer.NewConsumer[app.Event](streamClient, converter)
+	consumer := consumer.NewConsumer[app.Event](streamClient, converter, process)
 	producer := producer.NewProducer[app.Event](streamClient, converter)
 
-	go read(consumer, ctx)
+	consumer.Run(ctx)
 	go write(producer, ctx)
 
 	fmt.Printf("Redis started %s\n", "localhost:6379")
@@ -38,24 +38,9 @@ func streamClientInit(ctx context.Context, converter app.Converter[app.Event]) s
 		Batch:    50,
 	}
 
-	streamClient := streams.NewClient[app.Event](redisClient, clientParams, converter)
+	streamClient := streams.NewClient[app.Event](redisClient, clientParams)
 
 	return streamClient
-}
-
-func read(consumer consumer.Consumer[app.Event], ctx context.Context) {
-	for {
-		events, err := consumer.ReadGroup(ctx)
-		if err != nil {
-			fmt.Printf("read error %w\n", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		fmt.Printf("read event from %v: %v\n", "mystream", events)
-
-		time.Sleep(50 * time.Millisecond)
-	}
 }
 
 func write(producer producer.Producer[app.Event], ctx context.Context) {
@@ -72,4 +57,10 @@ func write(producer producer.Producer[app.Event], ctx context.Context) {
 
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func process(event app.Event) error {
+	fmt.Printf("read event from %v: %v\n", "mystream", event)
+
+	return nil
 }
