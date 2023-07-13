@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"math/rand"
 	"time"
 
 	"github.com/khv1one/goxstreams/internal/app"
@@ -14,11 +17,12 @@ import (
 
 func main() {
 	ctx := context.Background()
+	worker := Worker[app.Event]{"foo"}
 
 	converter := app.Converter[app.Event]{}
 	streamClient := streamClientInit(ctx, converter)
 
-	consumer := consumer.NewConsumer[app.Event](streamClient, converter, process)
+	consumer := consumer.NewConsumer[app.Event](streamClient, converter, worker, 3)
 	producer := producer.NewProducer[app.Event](streamClient, converter)
 
 	consumer.Run(ctx)
@@ -45,12 +49,12 @@ func streamClientInit(ctx context.Context, converter app.Converter[app.Event]) s
 
 func write(producer producer.Producer[app.Event], ctx context.Context) {
 	for {
-		event := app.Event{Message: "message", Name: "name", Foo: 777, Bar: 888}
+		event := app.Event{Message: "message", Name: "name", Foo: rand.Intn(1000), Bar: rand.Intn(1000)}
 
 		err := producer.Produce(ctx, event, "mystream")
-		//fmt.Printf("produced %v to %v\n", event, key)
+		fmt.Printf("produced %v\n", event)
 		if err != nil {
-			fmt.Printf("write error %w\n", err)
+			log.Printf("write error %v\n", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -59,8 +63,29 @@ func write(producer producer.Producer[app.Event], ctx context.Context) {
 	}
 }
 
-func process(event app.Event) error {
-	fmt.Printf("read event from %v: %v\n", "mystream", event)
+type Worker[E streams.RedisEvent] struct {
+	Name string
+}
+
+func (w Worker[E]) Process(event app.Event) error {
+	fmt.Printf("read event from %v: %v, worker: %v\n", "mystream", event, w.Name)
+
+	a := rand.Intn(2)
+	if a == 0 {
+		return errors.New("rand error")
+	}
+
+	return nil
+}
+
+func (w Worker[E]) ProcessBroken(broken map[string]interface{}) error {
+	fmt.Printf("read broken event from %v: %v, worker: %v\n", "mystream", broken, w.Name)
+
+	return nil
+}
+
+func (w Worker[E]) ProcessDead(dead app.Event) error {
+	fmt.Printf("event %v from stream %v is dead!, worker: %v\n", dead.RedisID, "mystream", w.Name)
 
 	return nil
 }
