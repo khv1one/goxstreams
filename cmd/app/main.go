@@ -23,10 +23,10 @@ func main() {
 	streamClient := streamClientInit(ctx, converter)
 
 	consumer := consumer.NewConsumer[app.Event](streamClient, converter, worker, 3)
-	producer := producer.NewProducer[app.Event](streamClient, converter)
+	//producer := producer.NewProducer[app.Event](streamClient, converter)
 
 	consumer.Run(ctx)
-	go write(producer, ctx)
+	//go write(producer, ctx)
 
 	fmt.Printf("Redis started %s\n", "localhost:6379")
 	fmt.Scanln()
@@ -59,7 +59,7 @@ func write(producer producer.Producer[app.Event], ctx context.Context) {
 			continue
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -75,6 +75,7 @@ func (w Worker[E]) Process(event app.Event) error {
 		return errors.New("rand error")
 	}
 
+	time.Sleep(500 * time.Millisecond)
 	return nil
 }
 

@@ -7,6 +7,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const redisID = "RedisID"
+
 type RedisEvent interface {
 	GetRedisID() string
 }
@@ -42,14 +44,14 @@ func NewClient[E RedisEvent](client *redis.Client, params Params) StreamClient[E
 		Count:    params.Batch,
 		Start:    "-",
 		End:      "+",
-		Idle:     time.Duration(250) * time.Millisecond,
+		Idle:     time.Duration(20000) * time.Millisecond,
 	}
 
 	claimArgs := &redis.XClaimArgs{
 		Stream:   params.Stream,
 		Group:    params.Group,
 		Consumer: params.Consumer,
-		MinIdle:  time.Duration(250) * time.Millisecond,
+		MinIdle:  time.Duration(20000) * time.Millisecond,
 	}
 
 	streamClient := StreamClient[E]{
@@ -83,7 +85,7 @@ func (c StreamClient[E]) ReadEvents(
 	for _, event := range streams[0].Messages {
 		convertedEvent, err := to(event.ID, event.Values)
 		if err != nil {
-			event.Values["RedisID"] = event.ID
+			event.Values[redisID] = event.ID
 			brokens = append(brokens, event.Values)
 			continue
 		}
@@ -180,7 +182,7 @@ func (c StreamClient[E]) convertEvents(
 	for _, rawEvent := range rawEvents {
 		convertedEvent, err := to(rawEvent.ID, rawEvent.Values)
 		if err != nil {
-			rawEvent.Values["RedisID"] = rawEvent.ID
+			rawEvent.Values[redisID] = rawEvent.ID
 			rawEvent.Values["Err"] = err.Error()
 			brokens = append(brokens, rawEvent.Values)
 			continue
@@ -190,4 +192,8 @@ func (c StreamClient[E]) convertEvents(
 	}
 
 	return events, brokens
+}
+
+func RedisID() string {
+	return redisID
 }

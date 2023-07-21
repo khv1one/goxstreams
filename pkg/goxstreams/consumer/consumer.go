@@ -11,6 +11,7 @@ type RedisEvent interface {
 	GetRedisID() string
 }
 
+// TODO remove E from client and remove Client interface
 type Client[E RedisEvent] interface {
 	ReadEvents(ctx context.Context, to func(string, map[string]interface{}) (E, error)) ([]E, []map[string]interface{}, error)
 	ReadFailEvents(
@@ -56,11 +57,24 @@ func NewConsumer[E RedisEvent](
 }
 
 func (c Consumer[E]) Run(ctx context.Context) {
-	go c.runEventsRead(ctx)
-	go c.runFailEventsRead(ctx)
+	eventStream := make(chan E)
+	failEventStream := make(chan map[string]interface{})
+	deadEventStream := make(chan E)
+
+	go c.runEventsRead(ctx, eventStream, failEventStream)
+	go c.runFailEventsRead(ctx, eventStream, failEventStream, deadEventStream)
+
+	for w := 1; w <= 100; w++ {
+		go c.runProccessing(ctx, eventStream, failEventStream, deadEventStream)
+	}
 }
 
-func (c Consumer[E]) runEventsRead(ctx context.Context) {
+func (c Consumer[E]) runEventsRead(ctx context.Context, stream chan E, brokenStream chan map[string]interface{}) {
+	defer func() {
+		close(stream)
+		close(brokenStream)
+	}()
+
 	for {
 		events, brokens, err := c.client.ReadEvents(ctx, c.converter.To)
 
@@ -70,12 +84,31 @@ func (c Consumer[E]) runEventsRead(ctx context.Context) {
 			continue
 		}
 
-		c.runEventProccessing(ctx, events)
-		c.runBrokenProccessing(ctx, brokens)
+		if len(events) > 0 {
+			go func() {
+				for _, event := range events {
+					stream <- event
+				}
+			}()
+		}
+
+		if len(brokens) > 0 {
+			go func() {
+				for _, broken := range brokens {
+					brokenStream <- broken
+				}
+			}()
+		}
 	}
 }
 
-func (c Consumer[E]) runFailEventsRead(ctx context.Context) {
+func (c Consumer[E]) runFailEventsRead(ctx context.Context, stream chan E, brokenStream chan map[string]interface{}, deadStream chan E) {
+	defer func() {
+		close(stream)
+		close(brokenStream)
+		close(deadStream)
+	}()
+
 	for {
 		events, deads, brokens, err := c.client.ReadFailEvents(ctx, c.converter.To, c.maxRetries)
 		if err != nil {
@@ -84,29 +117,51 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context) {
 			continue
 		}
 
-		c.runEventProccessing(ctx, events)
-		c.runBrokenProccessing(ctx, brokens)
-		c.runDeadProccessing(ctx, deads)
+		if len(events) > 0 {
+			go func() {
+				for _, event := range events {
+					stream <- event
+				}
+			}()
+		}
 
-		wait(10)
+		if len(brokens) > 0 {
+			go func() {
+				for _, broken := range brokens {
+					brokenStream <- broken
+				}
+			}()
+		}
+
+		if len(deads) > 0 {
+			go func() {
+				for _, dead := range deads {
+					deadStream <- dead
+				}
+			}()
+		}
+
+		wait(100)
 	}
 }
 
-func (c Consumer[E]) runEventProccessing(ctx context.Context, events []E) {
-	for _, event := range events {
-		c.processEvent(ctx, event)
-	}
-}
+func (c Consumer[E]) runProccessing(
+	ctx context.Context, stream <-chan E, brokenStream <-chan map[string]interface{}, deadStream <-chan E,
+) {
+	for {
+		select {
+		case event := <-stream:
+			c.processEvent(ctx, event)
 
-func (c Consumer[E]) runBrokenProccessing(ctx context.Context, brokens []map[string]interface{}) {
-	for _, event := range brokens {
-		c.processBroken(ctx, event)
-	}
-}
+		case broken := <-brokenStream:
+			c.processBroken(ctx, broken)
 
-func (c Consumer[E]) runDeadProccessing(ctx context.Context, deads []E) {
-	for _, event := range deads {
-		c.processDead(ctx, event)
+		case dead := <-deadStream:
+			c.processDead(ctx, dead)
+
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
