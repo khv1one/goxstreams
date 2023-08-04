@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"time"
 
 	"github.com/khv1one/goxstreams/internal/app"
-	streams "github.com/khv1one/goxstreams/pkg/goxstreams"
+	streams "github.com/khv1one/goxstreams/pkg/goxstreams/client"
 	"github.com/khv1one/goxstreams/pkg/goxstreams/consumer"
-	"github.com/khv1one/goxstreams/pkg/goxstreams/producer"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -20,50 +18,32 @@ func main() {
 	worker := Worker[app.Event]{"foo"}
 
 	converter := app.Converter[app.Event]{}
-	streamClient := streamClientInit(ctx, converter)
+	streamClient := streamClientInit()
 
 	consumer := consumer.NewConsumer[app.Event](streamClient, converter, worker, 3)
-	//producer := producer.NewProducer[app.Event](streamClient, converter)
 
 	consumer.Run(ctx)
-	//go write(producer, ctx)
 
 	fmt.Printf("Redis started %s\n", "localhost:6379")
 	fmt.Scanln()
 }
 
-func streamClientInit(ctx context.Context, converter app.Converter[app.Event]) streams.StreamClient[app.Event] {
+func streamClientInit() streams.StreamClient {
 	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
-	clientParams := streams.Params{
+	streamParams := streams.Params{
 		Stream:   "mystream",
 		Group:    "mygroup",
 		Consumer: "consumer",
 		Batch:    50,
 	}
 
-	streamClient := streams.NewClient[app.Event](redisClient, clientParams)
+	streamClient := streams.NewClient(redisClient, streamParams)
 
 	return streamClient
 }
 
-func write(producer producer.Producer[app.Event], ctx context.Context) {
-	for {
-		event := app.Event{Message: "message", Name: "name", Foo: rand.Intn(1000), Bar: rand.Intn(1000)}
-
-		err := producer.Produce(ctx, event, "mystream")
-		fmt.Printf("produced %v\n", event)
-		if err != nil {
-			log.Printf("write error %v\n", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-type Worker[E streams.RedisEvent] struct {
+type Worker[E consumer.RedisEvent] struct {
 	Name string
 }
 
