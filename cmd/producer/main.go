@@ -53,6 +53,6 @@ func write(producer producer.Producer[app.Event], ctx context.Context) {
 			continue
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }

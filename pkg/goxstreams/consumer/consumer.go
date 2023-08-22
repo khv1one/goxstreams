@@ -4,10 +4,12 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/khv1one/goxstreams/pkg/goxstreams"
+	"golang.org/x/sync/semaphore"
 
+	"github.com/khv1one/goxstreams/pkg/goxstreams"
 	"github.com/khv1one/goxstreams/pkg/goxstreams/client"
 )
 
@@ -51,98 +53,154 @@ func NewConsumer[E RedisEvent](
 }
 
 func (c Consumer[E]) Run(ctx context.Context) {
-	rawEvents := make(chan goxstreams.XRawMessage, 50)
-	events := make(chan E)
-	brokens := make(chan map[string]interface{})
-	deads := make(chan E)
+	//FanIn
+	in := c.merge(c.runEventsRead(ctx), c.runFailEventsRead(ctx))
 
-	go c.runEventsRead(rawEvents)
-	go c.runFailEventsRead(rawEvents)
+	//FanOut
+	events, deads, brokens := c.runConvertAndSplit(ctx, in)
 
-	go c.runConverting(rawEvents, events, deads, brokens)
-
-	for w := 1; w <= 100; w++ {
-		go c.runProccessing(ctx, events, deads, brokens)
-	}
+	c.runProccessing(ctx, events, deads, brokens)
 }
 
-func (c Consumer[E]) runEventsRead(stream chan goxstreams.XRawMessage) {
-	for {
-		ctx := context.Background()
-		events, err := c.client.ReadEvents(ctx)
-		if err != nil {
-			c.errorLog.Print(err)
-			wait(10)
-			continue
+func (c Consumer[E]) runEventsRead(ctx context.Context) <-chan goxstreams.XRawMessage {
+	out := make(chan goxstreams.XRawMessage)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				close(out)
+				return
+
+			default:
+				ctx := context.Background()
+				events, err := c.client.ReadEvents(ctx)
+				if err != nil {
+					c.errorLog.Print(err)
+					wait(10)
+					continue
+				}
+
+				for _, event := range events {
+					out <- event
+				}
+			}
 		}
-
-		for _, event := range events {
-			stream <- event
-		}
-	}
-}
-
-func (c Consumer[E]) runFailEventsRead(stream chan goxstreams.XRawMessage) {
-	for {
-		ctx := context.Background()
-		events, err := c.client.ReadFailEvents(ctx)
-		if err != nil {
-			c.errorLog.Print(err)
-			wait(10)
-			continue
-		}
-
-		for _, event := range events {
-			stream <- event
-		}
-
-		wait(100)
-	}
-}
-
-func (c Consumer[E]) runConverting(
-	in chan goxstreams.XRawMessage,
-	outEvents chan E,
-	outDeads chan E,
-	outBrokens chan map[string]interface{},
-) {
-	defer func() {
-		close(in)
-		close(outEvents)
-		close(outDeads)
-		close(outBrokens)
 	}()
 
-	for {
-		event := <-in
-		convertedEvent, err := c.convertEvent(event)
-		if err != nil {
-			event.Values["MessageID"] = event.ID
-			event.Values["ErrorMessage"] = err.Error()
-			outBrokens <- event.Values
-		}
+	return out
+}
 
-		if event.RetryCount > c.maxRetries {
-			outDeads <- convertedEvent
-		}
+func (c Consumer[E]) runFailEventsRead(ctx context.Context) <-chan goxstreams.XRawMessage {
+	out := make(chan goxstreams.XRawMessage)
 
-		outEvents <- convertedEvent
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				close(out)
+				return
+
+			default:
+				ctx := context.Background()
+				events, err := c.client.ReadFailEvents(ctx)
+				if err != nil {
+					c.errorLog.Print(err)
+					wait(10)
+					continue
+				}
+
+				for _, event := range events {
+					out <- event
+				}
+
+				wait(10)
+			}
+		}
+	}()
+
+	return out
+}
+
+func (c Consumer[E]) merge(cs ...<-chan goxstreams.XRawMessage) <-chan goxstreams.XRawMessage {
+	var wg sync.WaitGroup
+	out := make(chan goxstreams.XRawMessage)
+	wg.Add(len(cs))
+
+	for _, c := range cs {
+		go func(c <-chan goxstreams.XRawMessage) {
+			for n := range c {
+				out <- n
+			}
+			wg.Done()
+		}(c)
 	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+func (c Consumer[E]) runConvertAndSplit(
+	ctx context.Context,
+	in <-chan goxstreams.XRawMessage,
+) (<-chan E, <-chan E, <-chan map[string]interface{}) {
+	outEvents := make(chan E)
+	outDeads := make(chan E)
+	outBrokens := make(chan map[string]interface{})
+
+	toChannels := func() {
+		defer func() {
+			close(outEvents)
+			close(outDeads)
+			close(outBrokens)
+		}()
+
+		for {
+			select {
+			case event := <-in:
+				convertedEvent, err := c.convertEvent(event)
+				if err != nil {
+					event.Values["MessageID"] = event.ID
+					event.Values["ErrorMessage"] = err.Error()
+					outBrokens <- event.Values
+				}
+
+				if event.RetryCount > c.maxRetries {
+					outDeads <- convertedEvent
+				}
+
+				outEvents <- convertedEvent
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	go toChannels()
+
+	return outEvents, outDeads, outBrokens
 }
 
 func (c Consumer[E]) runProccessing(
 	ctx context.Context, stream, deadStream <-chan E, brokenStream <-chan map[string]interface{},
 ) {
+	sem := semaphore.NewWeighted(50)
+
 	for {
+		_ = sem.Acquire(ctx, 1)
 		select {
 		case event := <-stream:
-			c.processEvent(event)
+			go c.processEvent(sem, event)
 
 		case broken := <-brokenStream:
-			c.processBroken(broken)
+			go c.processBroken(sem, broken)
 
 		case dead := <-deadStream:
-			c.processDead(dead)
+			go c.processDead(sem, dead)
 
 		case <-ctx.Done():
 			return
@@ -150,7 +208,9 @@ func (c Consumer[E]) runProccessing(
 	}
 }
 
-func (c Consumer[E]) processEvent(event E) {
+func (c Consumer[E]) processEvent(sem *semaphore.Weighted, event E) {
+	defer sem.Release(1)
+
 	ctx := context.Background()
 
 	err := c.worker.Process(event)
@@ -174,7 +234,9 @@ func (c Consumer[E]) processEvent(event E) {
 	}
 }
 
-func (c Consumer[E]) processBroken(broken map[string]interface{}) {
+func (c Consumer[E]) processBroken(sem *semaphore.Weighted, broken map[string]interface{}) {
+	defer sem.Release(1)
+
 	ctx := context.Background()
 
 	err := c.worker.ProcessBroken(broken)
@@ -190,7 +252,9 @@ func (c Consumer[E]) processBroken(broken map[string]interface{}) {
 	}
 }
 
-func (c Consumer[E]) processDead(dead E) {
+func (c Consumer[E]) processDead(sem *semaphore.Weighted, dead E) {
+	defer sem.Release(1)
+
 	ctx := context.Background()
 
 	err := c.worker.ProcessDead(dead)

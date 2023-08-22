@@ -2,7 +2,10 @@ module github.com/khv1one/goxstreams
 
 go 1.20
 
-require github.com/redis/go-redis/v9 v9.0.2
+require (
+	github.com/redis/go-redis/v9 v9.0.2
+	golang.org/x/sync v0.3.0
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect

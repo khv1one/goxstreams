@@ -2,10 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"math/rand"
 	"time"
+	//"errors"
+	"fmt"
 
 	"github.com/khv1one/goxstreams/internal/app"
 	streams "github.com/khv1one/goxstreams/pkg/goxstreams/client"
@@ -21,7 +20,6 @@ func main() {
 	streamClient := streamClientInit()
 
 	consumer := consumer.NewConsumer[app.Event](streamClient, converter, worker, 3)
-
 	consumer.Run(ctx)
 
 	fmt.Printf("Redis started %s\n", "localhost:6379")
@@ -35,7 +33,7 @@ func streamClientInit() streams.StreamClient {
 		Stream:   "mystream",
 		Group:    "mygroup",
 		Consumer: "consumer",
-		Batch:    50,
+		Batch:    500,
 	}
 
 	streamClient := streams.NewClient(redisClient, streamParams)
@@ -50,12 +48,12 @@ type Worker[E consumer.RedisEvent] struct {
 func (w Worker[E]) Process(event app.Event) error {
 	fmt.Printf("read event from %v: %v, worker: %v\n", "mystream", event, w.Name)
 
-	a := rand.Intn(2)
-	if a == 0 {
-		return errors.New("rand error")
-	}
+	//	a := rand.Intn(2)
+	//	if a == 0 {
+	//		return errors.New("rand error")
+	//	}
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	return nil
 }
 
