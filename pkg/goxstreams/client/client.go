@@ -23,11 +23,6 @@ type Params struct {
 	NoAck    bool
 }
 
-type pendingMessage struct {
-	Id         string
-	RetryCount int64
-}
-
 func NewClient(client *redis.Client, params Params) StreamClient {
 	groupReadArgs := &redis.XReadGroupArgs{
 		Streams:  []string{params.Stream, ">"},

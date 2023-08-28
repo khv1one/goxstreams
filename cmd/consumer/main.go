@@ -2,9 +2,8 @@ package main
 
 import (
 	"context"
-	"time"
-	//"errors"
 	"fmt"
+	"time"
 
 	"github.com/khv1one/goxstreams/internal/app"
 	streams "github.com/khv1one/goxstreams/pkg/goxstreams/client"
@@ -22,8 +21,8 @@ func main() {
 	consumer := consumer.NewConsumer[app.Event](streamClient, converter, worker, 3)
 	consumer.Run(ctx)
 
-	fmt.Printf("Redis started %s\n", "localhost:6379")
-	fmt.Scanln()
+	fmt.Printf("Redis started %s", "localhost:6379")
+	<-ctx.Done()
 }
 
 func streamClientInit() streams.StreamClient {

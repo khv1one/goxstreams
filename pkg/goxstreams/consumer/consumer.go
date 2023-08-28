@@ -77,7 +77,8 @@ func (c Consumer[E]) runEventsRead(ctx context.Context) <-chan goxstreams.XRawMe
 				events, err := c.client.ReadEvents(ctx)
 				if err != nil {
 					c.errorLog.Print(err)
-					wait(10)
+					timer := time.NewTimer(10 * time.Millisecond)
+					<-timer.C
 					continue
 				}
 
@@ -93,6 +94,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context) <-chan goxstreams.XRawMe
 
 func (c Consumer[E]) runFailEventsRead(ctx context.Context) <-chan goxstreams.XRawMessage {
 	out := make(chan goxstreams.XRawMessage)
+	ticker := time.NewTicker(100 * time.Millisecond)
 
 	go func() {
 		for {
@@ -106,7 +108,7 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context) <-chan goxstreams.XR
 				events, err := c.client.ReadFailEvents(ctx)
 				if err != nil {
 					c.errorLog.Print(err)
-					wait(10)
+					<-ticker.C
 					continue
 				}
 
@@ -114,7 +116,7 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context) <-chan goxstreams.XR
 					out <- event
 				}
 
-				wait(10)
+				<-ticker.C
 			}
 		}
 	}()
@@ -127,13 +129,13 @@ func (c Consumer[E]) merge(cs ...<-chan goxstreams.XRawMessage) <-chan goxstream
 	out := make(chan goxstreams.XRawMessage)
 	wg.Add(len(cs))
 
-	for _, c := range cs {
+	for _, channel := range cs {
 		go func(c <-chan goxstreams.XRawMessage) {
 			for n := range c {
 				out <- n
 			}
 			wg.Done()
-		}(c)
+		}(channel)
 	}
 
 	go func() {
@@ -166,10 +168,12 @@ func (c Consumer[E]) runConvertAndSplit(
 					event.Values["MessageID"] = event.ID
 					event.Values["ErrorMessage"] = err.Error()
 					outBrokens <- event.Values
+					continue
 				}
 
 				if event.RetryCount > c.maxRetries {
 					outDeads <- convertedEvent
+					continue
 				}
 
 				outEvents <- convertedEvent
@@ -191,7 +195,11 @@ func (c Consumer[E]) runProccessing(
 	sem := semaphore.NewWeighted(50)
 
 	for {
-		_ = sem.Acquire(ctx, 1)
+		err := sem.Acquire(ctx, 1)
+		if err != nil {
+			c.errorLog.Fatal("can`t acquire semaphore: %v", err)
+		}
+
 		select {
 		case event := <-stream:
 			go c.processEvent(sem, event)
@@ -226,7 +234,7 @@ func (c Consumer[E]) processEvent(sem *semaphore.Weighted, event E) {
 	}
 
 	if c.cleaneUp {
-		err := c.client.Del(ctx, event.GetRedisID())
+		err = c.client.Del(ctx, event.GetRedisID())
 		if err != nil {
 			c.errorLog.Printf("id: %v, error: %v", event.GetRedisID(), err)
 			return
@@ -268,10 +276,6 @@ func (c Consumer[E]) processDead(sem *semaphore.Weighted, dead E) {
 		c.errorLog.Printf("id: %v, error: %v", dead.GetRedisID(), err)
 		return
 	}
-}
-
-func wait(durationMillis int) {
-	time.Sleep(time.Duration(durationMillis) * time.Millisecond)
 }
 
 func (c Consumer[E]) convertEvent(raw goxstreams.XRawMessage) (E, error) {
