@@ -50,27 +50,35 @@ func NewConsumer[E any](
 }
 
 func (c Consumer[E]) Run(ctx context.Context) {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+
+	go func() {
+		<-ctx.Done()
+		close(stop1)
+		close(stop2)
+	}()
+
 	//FanIn
-	in := c.merge(c.runEventsRead(ctx), c.runFailEventsRead(ctx))
+	in := c.merge(c.runEventsRead(ctx, stop1), c.runFailEventsRead(ctx, stop2))
 
 	//FanOut
-	events, deads, brokens := c.runConvertAndSplit(ctx, in)
+	events, deads, brokens := c.runConvertAndSplit(in)
 
-	c.runProccessing(ctx, events, deads, brokens)
+	c.runProccessing(events, deads, brokens)
 }
 
-func (c Consumer[E]) runEventsRead(ctx context.Context) <-chan goxstreams.XRawMessage {
+func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-chan goxstreams.XRawMessage {
 	out := make(chan goxstreams.XRawMessage)
 
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-stop:
 				close(out)
 				return
 
 			default:
-				ctx := context.Background()
 				events, err := c.client.ReadEvents(ctx)
 				if err != nil {
 					c.errorLog.Print(err)
@@ -89,19 +97,18 @@ func (c Consumer[E]) runEventsRead(ctx context.Context) <-chan goxstreams.XRawMe
 	return out
 }
 
-func (c Consumer[E]) runFailEventsRead(ctx context.Context) <-chan goxstreams.XRawMessage {
+func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}) <-chan goxstreams.XRawMessage {
 	out := make(chan goxstreams.XRawMessage)
 	ticker := time.NewTicker(100 * time.Millisecond)
 
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-stop:
 				close(out)
 				return
 
 			default:
-				ctx := context.Background()
 				events, err := c.client.ReadFailEvents(ctx)
 				if err != nil {
 					c.errorLog.Print(err)
@@ -143,7 +150,6 @@ func (c Consumer[E]) merge(cs ...<-chan goxstreams.XRawMessage) <-chan goxstream
 }
 
 func (c Consumer[E]) runConvertAndSplit(
-	ctx context.Context,
 	in <-chan goxstreams.XRawMessage,
 ) (<-chan E, <-chan E, <-chan map[string]interface{}) {
 	outEvents := make(chan E)
@@ -157,28 +163,24 @@ func (c Consumer[E]) runConvertAndSplit(
 			close(outBrokens)
 		}()
 
-		for {
-			select {
-			case event := <-in:
-				convertedEvent, err := c.convertEvent(event)
-				if err != nil {
-					event.Values["MessageID"] = event.ID
-					event.Values["ErrorMessage"] = err.Error()
-					outBrokens <- event.Values
-					continue
-				}
-
-				if event.RetryCount > c.maxRetries {
-					outDeads <- convertedEvent
-					continue
-				}
-
-				outEvents <- convertedEvent
-
-			case <-ctx.Done():
-				return
+		for event := range in {
+			convertedEvent, err := c.convertEvent(event)
+			if err != nil {
+				event.Values["MessageID"] = event.ID
+				event.Values["ErrorMessage"] = err.Error()
+				outBrokens <- event.Values
+				continue
 			}
+
+			if event.RetryCount > c.maxRetries {
+				outDeads <- convertedEvent
+				continue
+			}
+
+			outEvents <- convertedEvent
 		}
+
+		return
 	}
 
 	go toChannels()
@@ -187,36 +189,35 @@ func (c Consumer[E]) runConvertAndSplit(
 }
 
 func (c Consumer[E]) runProccessing(
-	ctx context.Context, stream, deadStream <-chan E, brokenStream <-chan map[string]interface{},
+	stream, deadStream <-chan E, brokenStream <-chan map[string]interface{},
 ) {
-	sem := semaphore.NewWeighted(50)
+	ctx := context.Background()
+	sem := semaphore.NewWeighted(20)
 
-	for {
-		err := sem.Acquire(ctx, 1)
-		if err != nil {
-			c.errorLog.Fatal("can`t acquire semaphore: %v", err)
+	go func() {
+		for event := range stream {
+			c.safeAcquire(ctx, sem)
+			go c.processEvent(ctx, sem, event)
 		}
+	}()
 
-		select {
-		case event := <-stream:
-			go c.processEvent(sem, event)
-
-		case broken := <-brokenStream:
-			go c.processBroken(sem, broken)
-
-		case dead := <-deadStream:
-			go c.processDead(sem, dead)
-
-		case <-ctx.Done():
-			return
+	go func() {
+		for event := range brokenStream {
+			c.safeAcquire(ctx, sem)
+			go c.processBroken(ctx, sem, event)
 		}
-	}
+	}()
+
+	go func() {
+		for event := range deadStream {
+			c.safeAcquire(ctx, sem)
+			go c.processDead(ctx, sem, event)
+		}
+	}()
 }
 
-func (c Consumer[E]) processEvent(sem *semaphore.Weighted, event E) {
+func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, event E) {
 	defer sem.Release(1)
-
-	ctx := context.Background()
 
 	err := c.worker.Process(event)
 	if err != nil {
@@ -239,10 +240,8 @@ func (c Consumer[E]) processEvent(sem *semaphore.Weighted, event E) {
 	}
 }
 
-func (c Consumer[E]) processBroken(sem *semaphore.Weighted, broken map[string]interface{}) {
+func (c Consumer[E]) processBroken(ctx context.Context, sem *semaphore.Weighted, broken map[string]interface{}) {
 	defer sem.Release(1)
-
-	ctx := context.Background()
 
 	err := c.worker.ProcessBroken(broken)
 	if err != nil {
@@ -257,10 +256,8 @@ func (c Consumer[E]) processBroken(sem *semaphore.Weighted, broken map[string]in
 	}
 }
 
-func (c Consumer[E]) processDead(sem *semaphore.Weighted, dead E) {
+func (c Consumer[E]) processDead(ctx context.Context, sem *semaphore.Weighted, dead E) {
 	defer sem.Release(1)
-
-	ctx := context.Background()
 
 	err := c.worker.ProcessDead(dead)
 	if err != nil {
@@ -282,4 +279,11 @@ func (c Consumer[E]) convertEvent(raw goxstreams.XRawMessage) (E, error) {
 	}
 
 	return convertedEvent, nil
+}
+
+func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted) {
+	err := sem.Acquire(ctx, 1)
+	if err != nil {
+		c.errorLog.Fatal("can`t acquire semaphore: %v", err)
+	}
 }

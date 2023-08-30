@@ -7,7 +7,7 @@ import (
 )
 
 type Converter[E any] interface {
-	From(event E) map[string]interface{} // TODO: добавить возможность ошибки
+	From(event E) map[string]interface{}
 }
 
 type Producer[E any] struct {
