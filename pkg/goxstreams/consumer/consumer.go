@@ -10,8 +10,14 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/khv1one/goxstreams/pkg/goxstreams"
-	"github.com/khv1one/goxstreams/pkg/goxstreams/client"
+	sc "github.com/khv1one/goxstreams/pkg/goxstreams/client"
+	"github.com/redis/go-redis/v9"
 )
+
+// RedisClient required to use cluster client
+type RedisClient interface {
+	redis.Cmdable
+}
 
 type Converter[E any] interface {
 	To(id string, event map[string]interface{}) (E, error)
@@ -24,43 +30,58 @@ type Worker[E any] interface {
 	ProcessDead(event E) error
 }
 
+type Config struct {
+	Stream       string
+	Group        string
+	ConsumerName string
+	BatchSize    int64
+	NoAck        bool
+	MaxRetries   int64
+	CleaneUp     bool
+
+	FailReadTime time.Duration
+}
+
 type Consumer[E any] struct {
-	client     client.StreamClient
-	converter  Converter[E]
-	worker     Worker[E]
-	cleaneUp   bool
-	skipDead   bool
-	maxRetries int64
-	errorLog   *log.Logger
+	client    sc.StreamClient
+	converter Converter[E]
+	worker    Worker[E]
+	errorLog  *log.Logger
+	config    Config
 }
 
 func NewConsumer[E any](
-	client client.StreamClient, converter Converter[E], worker Worker[E], maxRetries int64,
+	client RedisClient, converter Converter[E], worker Worker[E], config Config,
 ) Consumer[E] {
 	errorLog := log.New(os.Stderr, "ERROR\t", log.Ldate|log.Ltime|log.Lshortfile)
+	streamClient := sc.NewClient(client, sc.Params{
+		Stream:   config.Stream,
+		Group:    config.Group,
+		Consumer: config.ConsumerName,
+		Batch:    config.BatchSize,
+	})
+
 	return Consumer[E]{
-		client:     client,
-		converter:  converter,
-		worker:     worker,
-		cleaneUp:   false,
-		skipDead:   false,
-		maxRetries: maxRetries,
-		errorLog:   errorLog,
+		client:    streamClient,
+		converter: converter,
+		worker:    worker,
+		errorLog:  errorLog,
+		config:    config,
 	}
 }
 
 func (c Consumer[E]) Run(ctx context.Context) {
-	stop1 := make(chan struct{})
-	stop2 := make(chan struct{})
+	stopRead := make(chan struct{})
+	stopReadFail := make(chan struct{})
 
 	go func() {
 		<-ctx.Done()
-		close(stop1)
-		close(stop2)
+		close(stopRead)
+		close(stopReadFail)
 	}()
 
 	//FanIn
-	in := c.merge(c.runEventsRead(ctx, stop1), c.runFailEventsRead(ctx, stop2))
+	in := c.merge(c.runEventsRead(ctx, stopRead), c.runFailEventsRead(ctx, stopReadFail))
 
 	//FanOut
 	events, deads, brokens := c.runConvertAndSplit(in)
@@ -82,7 +103,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 				events, err := c.client.ReadEvents(ctx)
 				if err != nil {
 					c.errorLog.Print(err)
-					timer := time.NewTimer(10 * time.Millisecond)
+					timer := time.NewTimer(c.config.FailReadTime)
 					<-timer.C
 					continue
 				}
@@ -99,7 +120,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 
 func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}) <-chan goxstreams.XRawMessage {
 	out := make(chan goxstreams.XRawMessage)
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(c.config.FailReadTime)
 
 	go func() {
 		for {
@@ -172,7 +193,7 @@ func (c Consumer[E]) runConvertAndSplit(
 				continue
 			}
 
-			if event.RetryCount > c.maxRetries {
+			if event.RetryCount > c.config.MaxRetries {
 				outDeads <- convertedEvent
 				continue
 			}
@@ -231,7 +252,7 @@ func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, 
 		return
 	}
 
-	if c.cleaneUp {
+	if c.config.CleaneUp {
 		err = c.client.Del(ctx, c.converter.GetRedisID(event))
 		if err != nil {
 			c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
