@@ -13,21 +13,18 @@ import (
 	"github.com/khv1one/goxstreams/pkg/goxstreams/client"
 )
 
-type RedisEvent interface {
-	GetRedisID() string
-}
-
-type Converter[E RedisEvent] interface {
+type Converter[E any] interface {
 	To(id string, event map[string]interface{}) (E, error)
+	GetRedisID(E) string
 }
 
-type Worker[E RedisEvent] interface {
+type Worker[E any] interface {
 	Process(event E) error
 	ProcessBroken(event map[string]interface{}) error
 	ProcessDead(event E) error
 }
 
-type Consumer[E RedisEvent] struct {
+type Consumer[E any] struct {
 	client     client.StreamClient
 	converter  Converter[E]
 	worker     Worker[E]
@@ -37,7 +34,7 @@ type Consumer[E RedisEvent] struct {
 	errorLog   *log.Logger
 }
 
-func NewConsumer[E RedisEvent](
+func NewConsumer[E any](
 	client client.StreamClient, converter Converter[E], worker Worker[E], maxRetries int64,
 ) Consumer[E] {
 	errorLog := log.New(os.Stderr, "ERROR\t", log.Ldate|log.Ltime|log.Lshortfile)
@@ -223,20 +220,20 @@ func (c Consumer[E]) processEvent(sem *semaphore.Weighted, event E) {
 
 	err := c.worker.Process(event)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", event.GetRedisID(), err)
+		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
 		return
 	}
 
-	err = c.client.Ack(ctx, event.GetRedisID())
+	err = c.client.Ack(ctx, c.converter.GetRedisID(event))
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", event.GetRedisID(), err)
+		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
 		return
 	}
 
 	if c.cleaneUp {
-		err = c.client.Del(ctx, event.GetRedisID())
+		err = c.client.Del(ctx, c.converter.GetRedisID(event))
 		if err != nil {
-			c.errorLog.Printf("id: %v, error: %v", event.GetRedisID(), err)
+			c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
 			return
 		}
 	}
@@ -267,13 +264,13 @@ func (c Consumer[E]) processDead(sem *semaphore.Weighted, dead E) {
 
 	err := c.worker.ProcessDead(dead)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", dead.GetRedisID(), err)
+		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(dead), err)
 		return
 	}
 
-	err = c.client.Del(ctx, dead.GetRedisID())
+	err = c.client.Del(ctx, c.converter.GetRedisID(dead))
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", dead.GetRedisID(), err)
+		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(dead), err)
 		return
 	}
 }

@@ -8,8 +8,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// RedisClient required to use cluster client
+type RedisClient interface {
+	redis.Cmdable
+}
+
 type StreamClient struct {
-	client        *redis.Client
+	client        RedisClient
 	groupReadArgs *redis.XReadGroupArgs
 	pendingArgs   *redis.XPendingExtArgs
 	claimArgs     *redis.XClaimArgs
@@ -23,7 +28,7 @@ type Params struct {
 	NoAck    bool
 }
 
-func NewClient(client *redis.Client, params Params) StreamClient {
+func NewClient(client RedisClient, params Params) StreamClient {
 	groupReadArgs := &redis.XReadGroupArgs{
 		Streams:  []string{params.Stream, ">"},
 		Group:    params.Group,
