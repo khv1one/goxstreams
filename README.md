@@ -13,15 +13,15 @@ goxstreams lets you to post and processes messages asynchronously using Redis St
 
 ## Describe the business model
 
- - Describe the model that we want to put in the stream
+- Describe the model that we want to put in the stream
 
 ```go
 package app
 
 type Event struct {
 	RedisID string
-	Foo       string
-	Bar       int
+	Foo     string
+	Bar     int
 }
 ```
 
@@ -123,7 +123,6 @@ func write(producer goxstreams.Producer[app.Event], ctx context.Context) {
 ```
 You can use one producer to publish to different streams
 
-
 ## Processing messages
 ### Describe worker
 ```go
@@ -169,7 +168,7 @@ func (w Worker[E]) ProcessDead(dead Event) error {
 	return nil
 }
 ```
-you need to implement 3 methods:
+You need to implement 3 methods:
 - normal message processing (including reprocessing)
 - processing of messages that could not be converted to the model (for example, put them in the database for further investigation)
 - processing messages, the number of repetitions of which exceeded the number specified in the config
@@ -210,16 +209,16 @@ func consumerInit() goxstreams.Consumer[app.Event] {
 	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 	config := goxstreams.ConsumerConfig{
-		Stream:         	   "mystream",
-		Group:          	    "mygroup",
+		Stream:         "mystream",
+		Group:          "mygroup",
 		ConsumerName:   "consumer",
-		BatchSize:      	  100,
-		MaxConcurrency:  5000,
-		NoAck:          	   false,
-		MaxRetries:     	 3,
-		CleaneUp:       	  false,
-		FailReadTime:   	1000 * time.Millisecond,
-		FailIdle:       		  5000 * time.Millisecond,
+		BatchSize:      100,
+		MaxConcurrency: 5000,
+		NoAck:          false,
+		MaxRetries:     3,
+		CleaneUp:       false,
+		FailReadTime:   1000 * time.Millisecond,
+		FailIdle:       5000 * time.Millisecond,
 	}
 
 	myConsumer := goxstreams.NewConsumer[app.Event](
@@ -229,31 +228,31 @@ func consumerInit() goxstreams.Consumer[app.Event] {
 		config,
 	)
 
-    return myConsumer
+	return myConsumer
 }
 
 ```
 ### Config description
 - Stream
---the name of the stream from which we read messages
+-- the name of the stream from which we read messages
 - Group
---each group processes messages independently of the other
+-- each group processes messages independently of the other
 - ConsumerName
---client name in the group, may not be unique
+-- client name in the group, may not be unique
 - BatchSize
---the size of messages read from the stream per request
+-- the size of messages read from the stream per request
 - MaxConcurrency
---maximum number of message processing goroutines
+-- maximum number of message processing goroutines
 - NoAck
---when true - messages will not be reprocessed if there was an error
+-- when true - messages will not be reprocessed if there was an error
 - MaxRetries
---the number of times the message will be reprocessed on errors
+-- the number of times the message will be reprocessed on errors
 - CleaneUp
---automatic deletion of messages after successful processing
+-- automatic deletion of messages after successful processing
 - FailReadTime
---Failed messages read interval
+-- Failed messages read interval
 - FailIdle
---The time after which the message will be considered corrupted
+-- The time after which the message will be considered corrupted
 
 ## Benchmarks
 WIP

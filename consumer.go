@@ -1,3 +1,4 @@
+// Package goxstreams lets you to post and processes messages asynchronously using Redis Streams
 package goxstreams
 
 import (
@@ -10,17 +11,20 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// ConsumerConverter is an interface for convert hash to business model.
 type ConsumerConverter[E any] interface {
 	To(id string, event map[string]interface{}) (E, error)
 	GetRedisID(E) string
 }
 
+// Worker is an interface for processing messages from redis stream.
 type Worker[E any] interface {
 	Process(event E) error
 	ProcessBroken(event map[string]interface{}) error
 	ProcessDead(event E) error
 }
 
+// Consumer is a wrapper to easily getting messages from redis stream.
 type Consumer[E any] struct {
 	client    streamClient
 	converter ConsumerConverter[E]
@@ -29,6 +33,7 @@ type Consumer[E any] struct {
 	config    ConsumerConfig
 }
 
+// NewConsumer is a constructor Consumer struct.
 func NewConsumer[E any](
 	client RedisClient, converter ConsumerConverter[E], worker Worker[E], config ConsumerConfig,
 ) Consumer[E] {
@@ -51,6 +56,7 @@ func NewConsumer[E any](
 	}
 }
 
+// Run is a method to start processing messages from redis stream.
 func (c Consumer[E]) Run(ctx context.Context) {
 	stopRead := make(chan struct{})
 	stopReadFail := make(chan struct{})
@@ -286,6 +292,6 @@ func (c Consumer[E]) convertEvent(raw xRawMessage) (E, error) {
 func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted) {
 	err := sem.Acquire(ctx, 1)
 	if err != nil {
-		c.errorLog.Fatal("can`t acquire semaphore: %v", err)
+		c.errorLog.Fatalf("can`t acquire semaphore: %v\n", err)
 	}
 }
