@@ -30,18 +30,6 @@ type Worker[E any] interface {
 	ProcessDead(event E) error
 }
 
-type Config struct {
-	Stream       string
-	Group        string
-	ConsumerName string
-	BatchSize    int64
-	NoAck        bool
-	MaxRetries   int64
-	CleaneUp     bool
-
-	FailReadTime time.Duration
-}
-
 type Consumer[E any] struct {
 	client    sc.StreamClient
 	converter Converter[E]
@@ -59,6 +47,7 @@ func NewConsumer[E any](
 		Group:    config.Group,
 		Consumer: config.ConsumerName,
 		Batch:    config.BatchSize,
+		NoAck:    config.NoAck,
 	})
 
 	return Consumer[E]{
@@ -213,7 +202,7 @@ func (c Consumer[E]) runProccessing(
 	stream, deadStream <-chan E, brokenStream <-chan map[string]interface{},
 ) {
 	ctx := context.Background()
-	sem := semaphore.NewWeighted(20)
+	sem := semaphore.NewWeighted(c.config.MaxConcurrency)
 
 	go func() {
 		for event := range stream {
