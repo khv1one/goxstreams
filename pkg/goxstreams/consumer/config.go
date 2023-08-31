@@ -12,6 +12,7 @@ type Config struct {
 	MaxRetries     int64
 	CleaneUp       bool
 
+	FailIdle     time.Duration
 	FailReadTime time.Duration
 }
 
@@ -26,5 +27,9 @@ func (c Config) setDefaults() {
 
 	if c.FailReadTime == 0 {
 		c.FailReadTime = 1000 * time.Millisecond
+	}
+
+	if c.FailIdle == 0 {
+		c.FailIdle = 2000 * time.Millisecond
 	}
 }

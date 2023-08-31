@@ -48,6 +48,7 @@ func NewConsumer[E any](
 		Consumer: config.ConsumerName,
 		Batch:    config.BatchSize,
 		NoAck:    config.NoAck,
+		Idle:     config.FailIdle,
 	})
 
 	return Consumer[E]{

@@ -26,6 +26,7 @@ type Params struct {
 	Consumer string
 	Batch    int64
 	NoAck    bool
+	Idle     time.Duration
 }
 
 func NewClient(client RedisClient, params Params) StreamClient {
@@ -44,14 +45,14 @@ func NewClient(client RedisClient, params Params) StreamClient {
 		Count:    params.Batch,
 		Start:    "-",
 		End:      "+",
-		Idle:     time.Duration(5000) * time.Millisecond,
+		Idle:     params.Idle,
 	}
 
 	claimArgs := &redis.XClaimArgs{
 		Stream:   params.Stream,
 		Group:    params.Group,
 		Consumer: params.Consumer,
-		MinIdle:  time.Duration(5000) * time.Millisecond,
+		MinIdle:  params.Idle,
 	}
 
 	streamClient := StreamClient{
