@@ -19,64 +19,28 @@ goxstreams lets you to post and processes messages asynchronously using Redis St
 package app
 
 type Event struct {
-	RedisID string
-	Foo     string
-	Bar     int
+	Message  string
+	Name     string
+	Foo      int
+	Bar      int
+	SubEvent SubEvent
 }
+
+type SubEvent struct {
+	BarBar string
+	FooFoo SubSubEvent
+}
+
+type SubSubEvent struct {
+	FooFooFoo int
+}
+
 ```
 
-- Describe how this model is converted FROM a structure to a hash and TO a structure from a hash
-- Implement the method returning redis id
-
-```go
-type Converter[E any] struct{}
-
-func NewConverter[E any]() Converter[E] {
-	return Converter[E]{}
-}
-
-func (c Converter[E]) From(event Event) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	result["foo"] = event.Foo
-	result["bar"] = event.Bar
-
-	return result
-}
-
-func (c Converter[E]) To(id string, event map[string]interface{}) (Event, error) {
-	result := Event{}
-
-	foo, ok := event["foo"].(string)
-	if !ok {
-		return result, errors.New("error convert to EventStruct, foo is not exist")
-	}
-
-	barStr, ok := event["bar"].(string)
-	if !ok {
-		return result, errors.New("error convert to EventStruct, bar is not exist")
-	}
-	bar, err := strconv.Atoi(barStr)
-	if err != nil {
-		return result, err
-	}
-
-	result.RedisID = id
-	result.Foo = foo
-	result.Bar = bar
-
-	return result, nil
-}
-
-func (c Converter[E]) GetRedisID(event Event) string {
-	return event.RedisID
-}
-```
 ## Producing messages
 
 ### Initialize your application:
 - create go-redis client
-- create converter object
 - create producer
 
 ```go
@@ -97,8 +61,7 @@ import (
 func main() {
 	ctx := context.Background()
 
-	converter := app.Converter[app.Event]{}
-	producer := goxstreams.NewProducer[app.Event](redis.NewClient(&redis.Options{Addr: "localhost:6379"}), converter)
+	producer := goxstreams.NewProducer[app.Event](redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
 	go write(producer, ctx)
 
 	fmt.Println("Producer started")
@@ -107,19 +70,27 @@ func main() {
 
 func write(producer goxstreams.Producer[app.Event], ctx context.Context) {
 	for {
-		event := app.Event{Foo: "foo", Bar: rand.Intn(1000)}
+		event := app.Event{
+			Message: "message", Name: "name", Foo: rand.Intn(1000), Bar: rand.Intn(1000),
+			SubEvent: app.SubEvent{
+				BarBar: "1234",
+				FooFoo: app.SubSubEvent{FooFooFoo: 777},
+			},
+		}
 
 		err := producer.Produce(ctx, event, "mystream")
-		fmt.Printf("produced %v\n", event)
 		if err != nil {
 			fmt.Printf("write error %v\n", err)
 			time.Sleep(time.Second)
 			continue
 		}
 
+		fmt.Printf("produced %v\n", event)
+
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
 ```
 You can use one producer to publish to different streams
 
@@ -133,37 +104,42 @@ import (
 	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/khv1one/goxstreams"
 )
 
-type Worker[E any] struct {
+type Worker[E interface{ Event }] struct {
 	Name string
 }
 
-func NewWorker[E any](name string) Worker[E] {
+func NewWorker[E interface{ Event }](name string) Worker[E] {
 	return Worker[E]{Name: name}
 }
 
-func (w Worker[E]) Process(event Event) error {
+func (w Worker[E]) Process(event goxstreams.RedisMessage[E]) error {
 	time.Sleep(1000 * time.Millisecond)
 
 	a := rand.Intn(20)
 	if a == 0 {
 		return errors.New("rand error")
 	} else {
-		fmt.Printf("read event from %v: %v, worker: %v\n", "mystream", event, w.Name)
+		fmt.Printf("read event from %s: id: %s, retry: %d, body: %v, worker: %v\n",
+			"mystream", event.ID, event.RetryCount, event.Body, w.Name)
 	}
 
 	return nil
 }
 
-func (w Worker[E]) ProcessBroken(broken map[string]interface{}) error {
-	fmt.Printf("read broken event from %v: %v, worker: %v\n", "mystream", broken, w.Name)
+func (w Worker[E]) ProcessBroken(broken goxstreams.RedisBrokenMessage) error {
+	fmt.Printf("read broken event from %s: id: %s, retry: %d, body: %v, worker: %v, err: %s\n",
+		"mystream", broken.ID, broken.RetryCount, broken.Body, w.Name, broken.Error.Error())
 
 	return nil
 }
 
-func (w Worker[E]) ProcessDead(dead Event) error {
-	fmt.Printf("event %v from stream %v is dead!, worker: %v\n", dead.RedisID, "mystream", w.Name)
+func (w Worker[E]) ProcessDead(dead goxstreams.RedisMessage[E]) error {
+	fmt.Printf("read from %s is dead!!! id: %s, retry: %d, body: %v, worker: %v\n",
+		"mystream", dead.ID, dead.RetryCount, dead.Body, w.Name)
 
 	return nil
 }
@@ -171,11 +147,10 @@ func (w Worker[E]) ProcessDead(dead Event) error {
 You need to implement 3 methods:
 - normal message processing (including reprocessing)
 - processing of messages that could not be converted to the model (for example, put them in the database for further investigation)
-- processing messages, the number of repetitions of which exceeded the number specified in the config
+- processing messages, the number of retries of which exceeded the number specified in the config
 
 ### Initialize your application:
 - create go-redis client
-- create converter object
 - create worker object
 - create consumer config
 - create consumer
@@ -189,7 +164,7 @@ import (
 	"fmt"
 	"time"
 
-	"example/app"
+	"github.com/khv1one/goxstreams/internal/app"
 
 	"github.com/khv1one/goxstreams"
 	"github.com/redis/go-redis/v9"
@@ -221,16 +196,10 @@ func consumerInit() goxstreams.Consumer[app.Event] {
 		FailIdle:       5000 * time.Millisecond,
 	}
 
-	myConsumer := goxstreams.NewConsumer[app.Event](
-		redisClient,
-		app.NewConverter[app.Event](),
-		app.NewWorker[app.Event]("foo"),
-		config,
-	)
+	myConsumer := goxstreams.NewConsumer[app.Event](redisClient, app.NewWorker[app.Event]("foo"), config)
 
 	return myConsumer
 }
-
 ```
 ### Config description
 - Stream

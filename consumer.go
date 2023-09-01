@@ -11,31 +11,24 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// ConsumerConverter is an interface for convert hash to business model.
-type ConsumerConverter[E any] interface {
-	To(id string, event map[string]interface{}) (E, error)
-	GetRedisID(E) string
-}
-
 // Worker is an interface for processing messages from redis stream.
 type Worker[E any] interface {
-	Process(event E) error
-	ProcessBroken(event map[string]interface{}) error
-	ProcessDead(event E) error
+	Process(event RedisMessage[E]) error
+	ProcessBroken(event RedisBrokenMessage) error
+	ProcessDead(event RedisMessage[E]) error
 }
 
 // Consumer is a wrapper to easily getting messages from redis stream.
 type Consumer[E any] struct {
-	client    streamClient
-	converter ConsumerConverter[E]
-	worker    Worker[E]
-	errorLog  *log.Logger
-	config    ConsumerConfig
+	client   streamClient
+	worker   Worker[E]
+	errorLog *log.Logger
+	config   ConsumerConfig
 }
 
 // NewConsumer is a constructor Consumer struct.
 func NewConsumer[E any](
-	client RedisClient, converter ConsumerConverter[E], worker Worker[E], config ConsumerConfig,
+	client RedisClient, worker Worker[E], config ConsumerConfig,
 ) Consumer[E] {
 	errorLog := log.New(os.Stderr, "ERROR\t", log.Ldate|log.Ltime|log.Lshortfile)
 	streamClient := newClient(client, clientParams{
@@ -48,11 +41,10 @@ func NewConsumer[E any](
 	})
 
 	return Consumer[E]{
-		client:    streamClient,
-		converter: converter,
-		worker:    worker,
-		errorLog:  errorLog,
-		config:    config,
+		client:   streamClient,
+		worker:   worker,
+		errorLog: errorLog,
+		config:   config,
 	}
 }
 
@@ -159,10 +151,10 @@ func (c Consumer[E]) merge(cs ...<-chan xRawMessage) <-chan xRawMessage {
 
 func (c Consumer[E]) runConvertAndSplit(
 	in <-chan xRawMessage,
-) (<-chan E, <-chan E, <-chan map[string]interface{}) {
-	outEvents := make(chan E)
-	outDeads := make(chan E)
-	outBrokens := make(chan map[string]interface{})
+) (<-chan RedisMessage[E], <-chan RedisMessage[E], <-chan RedisBrokenMessage) {
+	outEvents := make(chan RedisMessage[E])
+	outDeads := make(chan RedisMessage[E])
+	outBrokens := make(chan RedisBrokenMessage)
 
 	toChannels := func() {
 		defer func() {
@@ -174,18 +166,16 @@ func (c Consumer[E]) runConvertAndSplit(
 		for event := range in {
 			convertedEvent, err := c.convertEvent(event)
 			if err != nil {
-				event.Values["MessageID"] = event.ID
-				event.Values["ErrorMessage"] = err.Error()
-				outBrokens <- event.Values
+				outBrokens <- newRedisBrokenMessage(event.ID, event.RetryCount, event.Values, err)
 				continue
 			}
 
 			if event.RetryCount > c.config.MaxRetries {
-				outDeads <- convertedEvent
+				outDeads <- newRedisMessage(event.ID, event.RetryCount, convertedEvent)
 				continue
 			}
 
-			outEvents <- convertedEvent
+			outEvents <- newRedisMessage(event.ID, event.RetryCount, convertedEvent)
 		}
 
 		return
@@ -197,91 +187,92 @@ func (c Consumer[E]) runConvertAndSplit(
 }
 
 func (c Consumer[E]) runProccessing(
-	stream, deadStream <-chan E, brokenStream <-chan map[string]interface{},
+	stream, deadStream <-chan RedisMessage[E], brokenStream <-chan RedisBrokenMessage,
 ) {
 	ctx := context.Background()
 	sem := semaphore.NewWeighted(c.config.MaxConcurrency)
 
 	go func() {
-		for event := range stream {
+		for message := range stream {
 			c.safeAcquire(ctx, sem)
-			go c.processEvent(ctx, sem, event)
+			go c.processEvent(ctx, sem, message)
 		}
 	}()
 
 	go func() {
-		for event := range brokenStream {
+		for message := range brokenStream {
 			c.safeAcquire(ctx, sem)
-			go c.processBroken(ctx, sem, event)
+			go c.processBroken(ctx, sem, message)
 		}
 	}()
 
 	go func() {
-		for event := range deadStream {
+		for message := range deadStream {
 			c.safeAcquire(ctx, sem)
-			go c.processDead(ctx, sem, event)
+			go c.processDead(ctx, sem, message)
 		}
 	}()
 }
 
-func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, event E) {
+func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, message RedisMessage[E]) {
 	defer sem.Release(1)
 
-	err := c.worker.Process(event)
+	err := c.worker.Process(message)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
+		c.errorLog.Printf("id: %v, error: %v", message.ID, err)
 		return
 	}
 
-	err = c.client.ack(ctx, c.converter.GetRedisID(event))
-	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
-		return
-	}
-
-	if c.config.CleaneUp {
-		err = c.client.del(ctx, c.converter.GetRedisID(event))
+	if !c.config.NoAck {
+		err = c.client.ack(ctx, message.ID)
 		if err != nil {
-			c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(event), err)
+			c.errorLog.Printf("id: %v, error: %v", message.ID, err)
+			return
+		}
+	}
+	if c.config.CleaneUp {
+		err = c.client.del(ctx, message.ID)
+		if err != nil {
+			c.errorLog.Printf("id: %v, error: %v", message.ID, err)
 			return
 		}
 	}
 }
 
-func (c Consumer[E]) processBroken(ctx context.Context, sem *semaphore.Weighted, broken map[string]interface{}) {
+func (c Consumer[E]) processBroken(ctx context.Context, sem *semaphore.Weighted, broken RedisBrokenMessage) {
 	defer sem.Release(1)
 
 	err := c.worker.ProcessBroken(broken)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", broken["ID"], err)
+		c.errorLog.Printf("id: %v, error: %v", broken.ID, err)
 		return
 	}
 
-	err = c.client.del(ctx, broken["ID"].(string))
+	err = c.client.del(ctx, broken.ID)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", broken["ID"], err)
+		c.errorLog.Printf("id: %v, error: %v", broken.ID, err)
 		return
 	}
 }
 
-func (c Consumer[E]) processDead(ctx context.Context, sem *semaphore.Weighted, dead E) {
+func (c Consumer[E]) processDead(ctx context.Context, sem *semaphore.Weighted, dead RedisMessage[E]) {
 	defer sem.Release(1)
 
 	err := c.worker.ProcessDead(dead)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(dead), err)
+		c.errorLog.Printf("id: %v, error: %v", dead.ID, err)
 		return
 	}
 
-	err = c.client.del(ctx, c.converter.GetRedisID(dead))
+	err = c.client.del(ctx, dead.ID)
 	if err != nil {
-		c.errorLog.Printf("id: %v, error: %v", c.converter.GetRedisID(dead), err)
+		c.errorLog.Printf("id: %v, error: %v", dead.ID, err)
 		return
 	}
 }
 
 func (c Consumer[E]) convertEvent(raw xRawMessage) (E, error) {
-	convertedEvent, err := c.converter.To(raw.ID, raw.Values)
+	convertedEvent, err := convertTo[E](raw.Values)
 	if err != nil {
 		return convertedEvent, err
 	}
