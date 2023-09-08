@@ -30,6 +30,8 @@ type Consumer[E any] struct {
 func NewConsumer[E any](
 	client RedisClient, worker Worker[E], config ConsumerConfig,
 ) Consumer[E] {
+	config.setDefaults()
+
 	streamClient := newClient(client, clientParams{
 		Stream:   config.Stream,
 		Group:    config.Group,
@@ -57,6 +59,8 @@ func NewConsumer[E any](
 func NewConsumerWithConverter[E any](
 	client RedisClient, worker Worker[E], convertTo func(event map[string]interface{}) (*E, error), config ConsumerConfig,
 ) Consumer[E] {
+	config.setDefaults()
+
 	consumer := NewConsumer(client, worker, config)
 	consumer.convertTo = convertTo
 
