@@ -47,7 +47,7 @@ type ConsumerConfig struct {
 	FailReadTime time.Duration // Default: 2 seconds
 }
 
-func (c ConsumerConfig) setDefaults() {
+func (c *ConsumerConfig) setDefaults() {
 	if c.BatchSize == 0 {
 		c.BatchSize = 1
 	}
