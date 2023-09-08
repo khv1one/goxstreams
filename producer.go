@@ -22,6 +22,7 @@ func NewProducer[E any](client RedisClient) Producer[E] {
 // Since Redis Streams messages are limited to a flat structure, we have 2 options available:
 //   - flat Example: ("foo_key", "foo_val", "bar_key", "bar_val");
 //   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
+//   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
 func NewProducerWithConverter[E any](client RedisClient, convertFrom func(event *E) (map[string]interface{}, error)) Producer[E] {
 	producer := NewProducer[E](client)
 	producer.convertFrom = convertFrom
@@ -29,6 +30,9 @@ func NewProducerWithConverter[E any](client RedisClient, convertFrom func(event 
 }
 
 // Produce method for push message to redis stream.
+//
+// With default converter, redis message will be like:
+//   - "xadd" "mystream" "*" "body" "{\"Message\":\"message\",\"Name\":\"name\",\"Foo\":712,\"Bar\":947}"
 func (p Producer[E]) Produce(ctx context.Context, event E, stream string) error {
 	eventData, err := p.convertFrom(&event)
 	if err != nil {
