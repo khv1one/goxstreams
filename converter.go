@@ -2,10 +2,10 @@ package goxstreams
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 )
 
-const valueField = "value"
+const valueField = "body"
 
 func convertFrom[E any](event E) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
@@ -15,7 +15,7 @@ func convertFrom[E any](event E) (map[string]interface{}, error) {
 		return result, err
 	}
 
-	result[valueField] = string(b)
+	result[valueField] = b
 	return result, nil
 }
 
@@ -24,7 +24,7 @@ func convertTo[E any](event map[string]interface{}) (E, error) {
 
 	data, ok := event[valueField].(string)
 	if !ok {
-		return result, errors.New("error convert to Event struct, value is not exist")
+		return result, fmt.Errorf("error convert to Event struct, %s is not exist", valueField)
 	}
 
 	err := json.Unmarshal([]byte(data), &result)
