@@ -64,6 +64,9 @@ func NewConsumerWithConverter[E any](
 }
 
 // Run is a method to start processing messages from redis stream.
+//
+// This method will start two processes: xreadgroup and xpending + xclaim.
+// To stop - just cancel the context
 func (c Consumer[E]) Run(ctx context.Context) {
 	stopRead := make(chan struct{})
 	stopReadFail := make(chan struct{})
@@ -74,8 +77,10 @@ func (c Consumer[E]) Run(ctx context.Context) {
 		close(stopReadFail)
 	}()
 
+	processCtx := context.Background()
+
 	//FanIn
-	in := c.merge(c.runEventsRead(ctx, stopRead), c.runFailEventsRead(ctx, stopReadFail))
+	in := c.merge(c.runEventsRead(processCtx, stopRead), c.runFailEventsRead(processCtx, stopReadFail))
 
 	//FanOut
 	events, deads, brokens := c.runConvertAndSplit(in)
