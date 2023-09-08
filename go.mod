@@ -3,7 +3,7 @@ module github.com/khv1one/goxstreams
 go 1.21
 
 require (
-	github.com/redis/go-redis/v9 v9.0.2
+	github.com/redis/go-redis/v9 v9.1.0
 	golang.org/x/sync v0.3.0
 )
 
