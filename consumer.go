@@ -28,26 +28,29 @@ type Consumer[E any] struct {
 
 // NewConsumer is a constructor Consumer struct.
 func NewConsumer[E any](
-	client RedisClient, worker Worker[E], config ConsumerConfig,
-) Consumer[E] {
+	ctx context.Context, client RedisClient, worker Worker[E], config ConsumerConfig,
+) (Consumer[E], error) {
 	config.setDefaults()
 
-	streamClient := newClient(client, clientParams{
-		Stream:   config.Stream,
-		Group:    config.Group,
-		Consumer: config.ConsumerName,
-		Batch:    config.BatchSize,
-		NoAck:    config.NoAck,
-		Idle:     config.FailIdle,
+	streamClient, err := newClientWithGroupInit(ctx, client, clientParams{
+		Stream:       config.Stream,
+		Group:        config.Group,
+		Consumer:     config.ConsumerName,
+		Batch:        config.BatchSize,
+		NoAck:        config.NoAck,
+		Idle:         config.FailIdle,
+		ReadInterval: config.ReadInterval,
 	})
 
-	return Consumer[E]{
+	consumer := Consumer[E]{
 		client:    streamClient,
 		worker:    worker,
 		errorLog:  newLogger(),
 		config:    config,
 		convertTo: convertTo[*E],
 	}
+
+	return consumer, err
 }
 
 // NewConsumerWithConverter is a constructor Consumer struct with custom convert.
@@ -57,14 +60,16 @@ func NewConsumer[E any](
 //   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
 //   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
 func NewConsumerWithConverter[E any](
-	client RedisClient, worker Worker[E], convertTo func(event map[string]interface{}) (*E, error), config ConsumerConfig,
-) Consumer[E] {
-	config.setDefaults()
-
-	consumer := NewConsumer(client, worker, config)
+	ctx context.Context,
+	client RedisClient,
+	worker Worker[E],
+	convertTo func(event map[string]interface{}) (*E, error),
+	config ConsumerConfig,
+) (Consumer[E], error) {
+	consumer, err := NewConsumer(ctx, client, worker, config)
 	consumer.convertTo = convertTo
 
-	return consumer
+	return consumer, err
 }
 
 // Run is a method to start processing messages from redis stream.
@@ -89,12 +94,13 @@ func (c Consumer[E]) Run(ctx context.Context) {
 	//FanOut
 	events, deads, brokens := c.runConvertAndSplit(in)
 
-	c.runProccessing(events, deads, brokens)
+	ackChan, delChan := c.runProccessing(processCtx, events, deads, brokens)
+	c.runFinishingBatching(processCtx, ackChan, c.client.ack)
+	c.runFinishingBatching(processCtx, delChan, c.client.del)
 }
 
 func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-chan xRawMessage {
 	out := make(chan xRawMessage)
-
 	go func() {
 		for {
 			select {
@@ -106,8 +112,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 				events, err := c.client.readEvents(ctx)
 				if err != nil {
 					c.errorLog.err(err)
-					timer := time.NewTimer(c.config.FailReadTime)
-					<-timer.C
+					<-time.NewTimer(c.config.ReadInterval).C
 					continue
 				}
 
@@ -123,7 +128,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 
 func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}) <-chan xRawMessage {
 	out := make(chan xRawMessage)
-	ticker := time.NewTicker(c.config.FailReadTime)
+	ticker := time.NewTicker(c.config.ReadInterval)
 
 	go func() {
 		for {
@@ -211,35 +216,60 @@ func (c Consumer[E]) runConvertAndSplit(
 }
 
 func (c Consumer[E]) runProccessing(
-	stream, deadStream <-chan RedisMessage[E], brokenStream <-chan RedisBrokenMessage,
-) {
-	ctx := context.Background()
+	ctx context.Context, stream, deadStream <-chan RedisMessage[E], brokenStream <-chan RedisBrokenMessage,
+) (<-chan string, <-chan string) {
+	ackChan := make(chan string, c.config.MaxConcurrency)
+	delChan := make(chan string, c.config.MaxConcurrency)
+
 	sem := semaphore.NewWeighted(c.config.MaxConcurrency)
+	var processesWg sync.WaitGroup
+	processesWg.Add(3)
+	var taleWg sync.WaitGroup
 
 	go func() {
 		for message := range stream {
-			c.safeAcquire(ctx, sem)
-			go c.processEvent(ctx, sem, message)
+			c.safeAcquire(ctx, sem, &taleWg)
+			go c.processEvent(ctx, message, sem, &taleWg, ackChan, delChan)
 		}
+
+		processesWg.Done()
 	}()
 
 	go func() {
 		for message := range brokenStream {
-			c.safeAcquire(ctx, sem)
-			go c.processBroken(ctx, sem, message)
+			c.safeAcquire(ctx, sem, &taleWg)
+			go c.processBroken(ctx, message, sem, &taleWg, delChan)
 		}
+
+		processesWg.Done()
 	}()
 
 	go func() {
 		for message := range deadStream {
-			c.safeAcquire(ctx, sem)
-			go c.processDead(ctx, sem, message)
+			c.safeAcquire(ctx, sem, &taleWg)
+			go c.processDead(ctx, message, sem, &taleWg, delChan)
 		}
+
+		processesWg.Done()
 	}()
+
+	go func() {
+		processesWg.Wait()
+		taleWg.Wait()
+		close(ackChan)
+		close(delChan)
+	}()
+
+	return ackChan, delChan
 }
 
-func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, message RedisMessage[E]) {
-	defer sem.Release(1)
+func (c Consumer[E]) processEvent(
+	ctx context.Context, message RedisMessage[E], sem *semaphore.Weighted, wg *sync.WaitGroup, ackChan, delChan chan<- string,
+) {
+	defer func() {
+		sem.Release(1)
+		wg.Done()
+	}()
 
 	err := c.worker.Process(message)
 	if err != nil {
@@ -248,23 +278,20 @@ func (c Consumer[E]) processEvent(ctx context.Context, sem *semaphore.Weighted, 
 	}
 
 	if !c.config.NoAck {
-		err = c.client.ack(ctx, message.ID)
-		if err != nil {
-			c.errorLog.print(fmt.Sprintf("id: %v, error: %v", message.ID, err))
-			return
-		}
+		ackChan <- message.ID
 	}
 	if c.config.CleaneUp {
-		err = c.client.del(ctx, message.ID)
-		if err != nil {
-			c.errorLog.print(fmt.Sprintf("id: %v, error: %v", message.ID, err))
-			return
-		}
+		delChan <- message.ID
 	}
 }
 
-func (c Consumer[E]) processBroken(ctx context.Context, sem *semaphore.Weighted, broken RedisBrokenMessage) {
-	defer sem.Release(1)
+func (c Consumer[E]) processBroken(
+	ctx context.Context, broken RedisBrokenMessage, sem *semaphore.Weighted, wg *sync.WaitGroup, delChan chan<- string,
+) {
+	defer func() {
+		sem.Release(1)
+		wg.Done()
+	}()
 
 	err := c.worker.ProcessBroken(broken)
 	if err != nil {
@@ -272,15 +299,16 @@ func (c Consumer[E]) processBroken(ctx context.Context, sem *semaphore.Weighted,
 		return
 	}
 
-	err = c.client.del(ctx, broken.ID)
-	if err != nil {
-		c.errorLog.print(fmt.Sprintf("id: %v, error: %v", broken.ID, err))
-		return
-	}
+	delChan <- broken.ID
 }
 
-func (c Consumer[E]) processDead(ctx context.Context, sem *semaphore.Weighted, dead RedisMessage[E]) {
-	defer sem.Release(1)
+func (c Consumer[E]) processDead(
+	ctx context.Context, dead RedisMessage[E], sem *semaphore.Weighted, wg *sync.WaitGroup, delChan chan<- string,
+) {
+	defer func() {
+		sem.Release(1)
+		wg.Done()
+	}()
 
 	err := c.worker.ProcessDead(dead)
 	if err != nil {
@@ -288,11 +316,60 @@ func (c Consumer[E]) processDead(ctx context.Context, sem *semaphore.Weighted, d
 		return
 	}
 
-	err = c.client.del(ctx, dead.ID)
-	if err != nil {
-		c.errorLog.print(fmt.Sprintf("id: %v, error: %v", dead.ID, err))
-		return
+	delChan <- dead.ID
+}
+
+func (c Consumer[E]) runFinishingBatching(ctx context.Context, idsChan <-chan string, f func(ctx context.Context, ids []string) error) {
+	var m sync.Mutex
+	stopTimer := make(chan struct{})
+	ticker := time.NewTicker(100 * time.Millisecond)
+
+	ids := make([]string, c.config.MaxConcurrency)
+	i := 0
+
+	fCall := func() {
+		if i > 0 {
+			if err := f(ctx, ids[:i]); err != nil {
+				c.errorLog.err(err)
+			}
+
+			i = 0
+			ticker.Reset(100 * time.Millisecond)
+		}
 	}
+
+	go func() {
+		for id := range idsChan {
+			m.Lock()
+			ids[i] = id
+			i++
+
+			if int64(i) == c.config.MaxConcurrency {
+				fCall()
+			}
+			m.Unlock()
+		}
+
+		m.Lock()
+		fCall()
+		m.Unlock()
+
+		close(stopTimer)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-stopTimer:
+				return
+
+			case <-ticker.C:
+				m.Lock()
+				fCall()
+				m.Unlock()
+			}
+		}
+	}()
 }
 
 func (c Consumer[E]) convertEvent(raw xRawMessage) (E, error) {
@@ -304,7 +381,8 @@ func (c Consumer[E]) convertEvent(raw xRawMessage) (E, error) {
 	return *convertedEvent, nil
 }
 
-func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted) {
+func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted, wg *sync.WaitGroup) {
+	wg.Add(1)
 	err := sem.Acquire(ctx, 1)
 	if err != nil {
 		c.errorLog.fatal(fmt.Sprintf("can`t acquire semaphore: %v\n", err))

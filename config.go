@@ -37,30 +37,33 @@ type ConsumerConfig struct {
 	Stream         string
 	Group          string
 	ConsumerName   string
-	BatchSize      int64 // Default: 1
-	MaxConcurrency int64 // Default: 1
-	NoAck          bool  // Default: false
-	MaxRetries     int64 // Default: 0
-	CleaneUp       bool  // Default: false
+	BatchSize      int64         // Default: 10
+	MaxConcurrency int64         // Default: 20
+	NoAck          bool          // Default: false
+	MaxRetries     int64         // Default: 0
+	CleaneUp       bool          // Default: false
+	ReadInterval   time.Duration // Default: 1 second
 
-	FailIdle     time.Duration // Default: 1 second
-	FailReadTime time.Duration // Default: 2 seconds
+	FailIdle time.Duration // Default: 1 minute
 }
 
 func (c *ConsumerConfig) setDefaults() {
-	if c.BatchSize == 0 {
-		c.BatchSize = 1
-	}
-
 	if c.MaxConcurrency == 0 {
-		c.MaxConcurrency = 1
+		c.MaxConcurrency = 20
 	}
 
-	if c.FailReadTime == 0 {
-		c.FailReadTime = 1000 * time.Millisecond
+	if c.BatchSize == 0 {
+		size := c.MaxConcurrency / 10
+		if size < 10 {
+			size = 10
+		}
+	}
+
+	if c.ReadInterval == 0 {
+		c.ReadInterval = 1000 * time.Millisecond
 	}
 
 	if c.FailIdle == 0 {
-		c.FailIdle = 2000 * time.Millisecond
+		c.FailIdle = 60 * time.Second
 	}
 }
