@@ -57,6 +57,8 @@ func (c *ConsumerConfig) setDefaults() {
 		if size < 10 {
 			size = 10
 		}
+
+		c.BatchSize = size
 	}
 
 	if c.ReadInterval == 0 {
