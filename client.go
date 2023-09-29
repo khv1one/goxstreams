@@ -2,6 +2,7 @@ package goxstreams
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -20,12 +21,13 @@ type streamClient struct {
 }
 
 type clientParams struct {
-	Stream   string
-	Group    string
-	Consumer string
-	Batch    int64
-	NoAck    bool
-	Idle     time.Duration
+	Stream       string
+	Group        string
+	Consumer     string
+	Batch        int64
+	NoAck        bool
+	Idle         time.Duration
+	ReadInterval time.Duration
 }
 
 func newClient(client RedisClient, params clientParams) streamClient {
@@ -35,6 +37,7 @@ func newClient(client RedisClient, params clientParams) streamClient {
 		Consumer: params.Consumer,
 		Count:    params.Batch,
 		NoAck:    params.NoAck,
+		Block:    params.ReadInterval,
 	}
 
 	pendingArgs := &redis.XPendingExtArgs{
@@ -64,6 +67,37 @@ func newClient(client RedisClient, params clientParams) streamClient {
 	return streamClient
 }
 
+func newClientWithGroupInit(ctx context.Context, client RedisClient, params clientParams) (streamClient, error) {
+	return newClient(client, params).init(ctx, params)
+}
+
+func (c streamClient) init(ctx context.Context, params clientParams) (streamClient, error) {
+	if params.Stream == "" || params.Group == "" {
+		return c, errors.New("stream and group can not be empty")
+	}
+
+	infos, err := c.client.XInfoGroups(ctx, params.Stream).Result()
+	if err != nil {
+		if err.Error() == "ERR no such key" {
+			if _, err = c.client.XGroupCreateMkStream(ctx, params.Stream, params.Group, "0").Result(); err != nil {
+				return c, err
+			}
+
+			return c, nil
+		}
+		return c, err
+	}
+
+	for _, info := range infos {
+		if info.Name == params.Group {
+			return c, nil
+		}
+	}
+
+	_, err = c.client.XGroupCreate(ctx, params.Stream, params.Group, "0").Result()
+	return c, err
+}
+
 func (c streamClient) add(
 	ctx context.Context, stream string, event map[string]interface{},
 ) error {
@@ -72,9 +106,25 @@ func (c streamClient) add(
 	return err
 }
 
+func (c streamClient) addBatch(
+	ctx context.Context, stream string, events []map[string]interface{},
+) error {
+	_, err := c.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, event := range events {
+			pipe.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: event})
+		}
+		return nil
+	})
+
+	return err
+}
+
 func (c streamClient) readEvents(ctx context.Context) ([]xRawMessage, error) {
 	streams, err := c.client.XReadGroup(ctx, c.groupReadArgs).Result()
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -109,14 +159,14 @@ func (c streamClient) readFailEvents(ctx context.Context) ([]xRawMessage, error)
 	return result, nil
 }
 
-func (c streamClient) ack(ctx context.Context, id string) error {
-	res := c.client.XAck(ctx, c.groupReadArgs.Streams[0], c.groupReadArgs.Group, id)
+func (c streamClient) ack(ctx context.Context, ids []string) error {
+	res := c.client.XAck(ctx, c.groupReadArgs.Streams[0], c.groupReadArgs.Group, ids...)
 
 	return res.Err()
 }
 
-func (c streamClient) del(ctx context.Context, id string) error {
-	res := c.client.XDel(ctx, c.groupReadArgs.Streams[0], id)
+func (c streamClient) del(ctx context.Context, ids []string) error {
+	res := c.client.XDel(ctx, c.groupReadArgs.Streams[0], ids...)
 
 	return res.Err()
 }
