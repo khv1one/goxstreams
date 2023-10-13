@@ -1,4 +1,4 @@
-// Package goxstreams lets you to post and processes messages asynchronously using Redis Streams
+// Package goxstreams lets you post and processes messages asynchronously using Redis Streams
 package goxstreams
 
 import (
@@ -109,16 +109,23 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 				return
 
 			default:
-				events, err := c.client.readEvents(ctx)
+				eventsPtr, err := c.client.readEvents(ctx)
 				if err != nil {
 					c.errorLog.err(err)
 					<-time.NewTimer(c.config.ReadInterval).C
 					continue
 				}
 
+				if eventsPtr == nil {
+					continue
+				}
+
+				events := *eventsPtr
 				for _, event := range events {
 					out <- event
 				}
+
+				c.client.eventPool.xMessagePut(eventsPtr)
 			}
 		}
 	}()
@@ -138,16 +145,23 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}
 				return
 
 			default:
-				events, err := c.client.readFailEvents(ctx)
+				eventsPtr, err := c.client.readFailEvents(ctx)
 				if err != nil {
 					c.errorLog.err(err)
 					<-ticker.C
 					continue
 				}
 
+				if eventsPtr == nil {
+					<-ticker.C
+					continue
+				}
+
+				events := *eventsPtr
 				for _, event := range events {
 					out <- event
 				}
+				c.client.eventPool.xMessagePut(eventsPtr)
 
 				<-ticker.C
 			}
