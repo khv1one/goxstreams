@@ -10,14 +10,15 @@ import (
 
 // RedisClient required to use cluster client
 type RedisClient interface {
-	redis.Cmdable
+	redis.StreamCmdable
 }
-
 type streamClient struct {
 	client        RedisClient
 	groupReadArgs *redis.XReadGroupArgs
 	pendingArgs   *redis.XPendingExtArgs
 	claimArgs     *redis.XClaimArgs
+
+	eventPool *pools
 }
 
 type clientParams struct {
@@ -62,6 +63,7 @@ func newClient(client RedisClient, params clientParams) streamClient {
 		groupReadArgs: groupReadArgs,
 		pendingArgs:   pendingArgs,
 		claimArgs:     claimArgs,
+		eventPool:     newPools(int(params.Batch)),
 	}
 
 	return streamClient
@@ -106,20 +108,7 @@ func (c streamClient) add(
 	return err
 }
 
-func (c streamClient) addBatch(
-	ctx context.Context, stream string, events []map[string]interface{},
-) error {
-	_, err := c.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-		for _, event := range events {
-			pipe.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: event})
-		}
-		return nil
-	})
-
-	return err
-}
-
-func (c streamClient) readEvents(ctx context.Context) ([]xRawMessage, error) {
+func (c streamClient) readEvents(ctx context.Context) (*[]xRawMessage, error) {
 	streams, err := c.client.XReadGroup(ctx, c.groupReadArgs).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -128,19 +117,20 @@ func (c streamClient) readEvents(ctx context.Context) ([]xRawMessage, error) {
 		return nil, err
 	}
 
-	result := make([]xRawMessage, 0, len(streams[0].Messages))
-	for _, message := range streams[0].Messages {
-		result = append(result, newXMessage(message.ID, 0, message.Values))
-	}
-
-	return result, nil
+	return c.xStreamToXRawMessage(streams), nil
 }
 
-func (c streamClient) readFailEvents(ctx context.Context) ([]xRawMessage, error) {
-	pendingsIds, pendingCountByID, pendingErr := c.pending(ctx)
+func (c streamClient) readFailEvents(ctx context.Context) (*[]xRawMessage, error) {
+	pendingsIdsPtr, pendingCountByIDPtr, pendingErr := c.pending(ctx)
 	if pendingErr != nil {
 		return nil, pendingErr
 	}
+	if pendingsIdsPtr == nil {
+		return nil, nil
+	}
+
+	pendingsIds := *pendingsIdsPtr
+	pendingCountByID := *pendingCountByIDPtr
 
 	if len(pendingsIds) == 0 {
 		return nil, nil
@@ -151,12 +141,12 @@ func (c streamClient) readFailEvents(ctx context.Context) ([]xRawMessage, error)
 		return nil, eventsErr
 	}
 
-	result := make([]xRawMessage, 0, len(pendingsIds))
-	for _, event := range events {
-		result = append(result, newXMessage(event.ID, pendingCountByID[event.ID], event.Values))
-	}
+	resultPtr := c.xStreamToXRawMessageRetries(events, pendingCountByID)
 
-	return result, nil
+	c.eventPool.stringPut(pendingsIdsPtr)
+	c.eventPool.stringIntMapPut(pendingCountByIDPtr)
+
+	return resultPtr, nil
 }
 
 func (c streamClient) ack(ctx context.Context, ids []string) error {
@@ -171,7 +161,7 @@ func (c streamClient) del(ctx context.Context, ids []string) error {
 	return res.Err()
 }
 
-func (c streamClient) pending(ctx context.Context) ([]string, map[string]int64, error) {
+func (c streamClient) pending(ctx context.Context) (*[]string, *map[string]int64, error) {
 	pendings, err := c.client.XPendingExt(ctx, c.pendingArgs).Result()
 	if err != nil {
 		return nil, nil, err
@@ -181,13 +171,9 @@ func (c streamClient) pending(ctx context.Context) ([]string, map[string]int64, 
 		return nil, nil, nil
 	}
 
-	pendingIds := make([]string, 0, len(pendings))
-	pendingCountByID := make(map[string]int64, len(pendings))
-	for _, pendingEvent := range pendings {
-		pendingIds = append(pendingIds, pendingEvent.ID)
-		pendingCountByID[pendingEvent.ID] = pendingEvent.RetryCount
-	}
-	return pendingIds, pendingCountByID, nil
+	pendingIdsPtr, pendingCountByIDPtr := c.preparePendings(pendings)
+
+	return pendingIdsPtr, pendingCountByIDPtr, nil
 }
 
 func (c streamClient) claiming(ctx context.Context, ids []string) ([]redis.XMessage, error) {
@@ -209,4 +195,46 @@ func (c streamClient) claim(ctx context.Context, ids []string) ([]redis.XMessage
 	rawEvents, err := c.client.XClaim(ctx, args).Result()
 
 	return rawEvents, err
+}
+
+func (c streamClient) preparePendings(pendings []redis.XPendingExt) (*[]string, *map[string]int64) {
+	pendingIdsPtr := c.eventPool.stringGet()
+	pendingIds := *pendingIdsPtr
+
+	pendingCountByIDPtr := c.eventPool.stringIntMapGet()
+	pendingCountByID := *pendingCountByIDPtr
+
+	for _, pendingEvent := range pendings {
+		pendingIds = append(pendingIds, pendingEvent.ID)
+		pendingCountByID[pendingEvent.ID] = pendingEvent.RetryCount
+	}
+	pendingIdsPtr = &pendingIds
+
+	return pendingIdsPtr, pendingCountByIDPtr
+}
+
+func (c streamClient) xStreamToXRawMessage(streams []redis.XStream) *[]xRawMessage {
+	ptr := c.eventPool.xMessageGet()
+	buf := *ptr
+
+	for _, message := range streams[0].Messages {
+		buf = append(buf, newXMessage(message.ID, 0, message.Values))
+	}
+	ptr = &buf
+
+	return ptr
+}
+
+func (c streamClient) xStreamToXRawMessageRetries(
+	events []redis.XMessage, pendingCountByID map[string]int64,
+) *[]xRawMessage {
+	//result := make([]xRawMessage, 0, len(pendingsIds))
+	ptr := c.eventPool.xMessageGet()
+	buf := *ptr
+	for _, event := range events {
+		buf = append(buf, newXMessage(event.ID, pendingCountByID[event.ID], event.Values))
+	}
+	ptr = &buf
+
+	return ptr
 }
