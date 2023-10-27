@@ -12,9 +12,9 @@ import (
 
 // Worker is an interface for processing messages from redis stream.
 type Worker[E any] interface {
-	Process(event RedisMessage[E]) error
-	ProcessBroken(event RedisBrokenMessage) error
-	ProcessDead(event RedisMessage[E]) error
+	Process(ctx context.Context, event RedisMessage[E]) error
+	ProcessBroken(ctx context.Context, event RedisBrokenMessage) error
+	ProcessDead(ctx context.Context, event RedisMessage[E]) error
 }
 
 // Consumer is a wrapper to easily getting messages from redis stream.
@@ -241,7 +241,7 @@ func (c Consumer[E]) runProccessing(
 	go func() {
 		for message := range stream {
 			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processEvent(ctx, message, sem, &taleWg, ackChan, delChan)
+			go c.processEvent(context.WithoutCancel(ctx), message, sem, &taleWg, ackChan, delChan)
 		}
 
 		processesWg.Done()
@@ -250,7 +250,7 @@ func (c Consumer[E]) runProccessing(
 	go func() {
 		for message := range brokenStream {
 			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processBroken(ctx, message, sem, &taleWg, delChan)
+			go c.processBroken(context.WithoutCancel(ctx), message, sem, &taleWg, delChan)
 		}
 
 		processesWg.Done()
@@ -259,7 +259,7 @@ func (c Consumer[E]) runProccessing(
 	go func() {
 		for message := range deadStream {
 			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processDead(ctx, message, sem, &taleWg, delChan)
+			go c.processDead(context.WithoutCancel(ctx), message, sem, &taleWg, delChan)
 		}
 
 		processesWg.Done()
@@ -283,7 +283,7 @@ func (c Consumer[E]) processEvent(
 		wg.Done()
 	}()
 
-	err := c.worker.Process(message)
+	err := c.worker.Process(ctx, message)
 	if err != nil {
 		c.errorLog.print(fmt.Sprintf("id: %v, error: %v", message.ID, err))
 		return
@@ -305,7 +305,7 @@ func (c Consumer[E]) processBroken(
 		wg.Done()
 	}()
 
-	err := c.worker.ProcessBroken(broken)
+	err := c.worker.ProcessBroken(ctx, broken)
 	if err != nil {
 		c.errorLog.print(fmt.Sprintf("id: %v, error: %v", broken.ID, err))
 		return
@@ -322,7 +322,7 @@ func (c Consumer[E]) processDead(
 		wg.Done()
 	}()
 
-	err := c.worker.ProcessDead(dead)
+	err := c.worker.ProcessDead(ctx, dead)
 	if err != nil {
 		c.errorLog.print(fmt.Sprintf("id: %v, error: %v", dead.ID, err))
 		return
@@ -331,7 +331,9 @@ func (c Consumer[E]) processDead(
 	delChan <- dead.ID
 }
 
-func (c Consumer[E]) runFinishingBatching(ctx context.Context, idsChan <-chan string, f func(ctx context.Context, ids []string) error) {
+func (c Consumer[E]) runFinishingBatching(
+	ctx context.Context, idsChan <-chan string, f func(ctx context.Context, ids []string) error,
+) {
 	var m sync.Mutex
 	stopTimer := make(chan struct{})
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -340,6 +342,7 @@ func (c Consumer[E]) runFinishingBatching(ctx context.Context, idsChan <-chan st
 	i := 0
 
 	fCall := func() {
+		m.Lock()
 		if i > 0 {
 			if err := f(ctx, ids[:i]); err != nil {
 				c.errorLog.err(err)
@@ -348,23 +351,20 @@ func (c Consumer[E]) runFinishingBatching(ctx context.Context, idsChan <-chan st
 			i = 0
 			ticker.Reset(100 * time.Millisecond)
 		}
+		m.Unlock()
 	}
 
 	go func() {
 		for id := range idsChan {
-			m.Lock()
 			ids[i] = id
-			i++
+			i += 1
 
 			if int64(i) == c.config.MaxConcurrency {
 				fCall()
 			}
-			m.Unlock()
 		}
 
-		m.Lock()
 		fCall()
-		m.Unlock()
 
 		close(stopTimer)
 	}()
@@ -376,9 +376,7 @@ func (c Consumer[E]) runFinishingBatching(ctx context.Context, idsChan <-chan st
 				return
 
 			case <-ticker.C:
-				m.Lock()
 				fCall()
-				m.Unlock()
 			}
 		}
 	}()
