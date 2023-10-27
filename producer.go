@@ -43,16 +43,16 @@ func (p Producer[E]) Produce(ctx context.Context, event E, stream string) error 
 }
 
 func (p Producer[E]) ProduceBatch(ctx context.Context, events []E, stream string) error {
+	converted := make([]map[string]interface{}, 0, len(events))
+
 	for _, event := range events {
 		eventData, err := p.convertFrom(&event)
 		if err != nil {
 			continue
 		}
 
-		err = p.client.add(ctx, stream, eventData)
-		if err != nil {
-			return err
-		}
+		converted = append(converted, eventData)
 	}
-	return nil
+
+	return p.client.addBatch(ctx, stream, converted)
 }

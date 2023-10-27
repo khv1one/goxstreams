@@ -77,19 +77,17 @@ func NewConsumerWithConverter[E any](
 // This method will start two processes: xreadgroup and xpending + xclaim.
 // To stop - just cancel the context
 func (c Consumer[E]) Run(ctx context.Context) {
-	stopRead := make(chan struct{})
-	stopReadFail := make(chan struct{})
+	stop := make(chan struct{})
 
 	go func() {
 		<-ctx.Done()
-		close(stopRead)
-		close(stopReadFail)
+		close(stop)
 	}()
 
 	processCtx := context.Background()
 
 	//FanIn
-	in := c.merge(c.runEventsRead(processCtx, stopRead), c.runFailEventsRead(processCtx, stopReadFail))
+	in := c.merge(c.runEventsRead(processCtx, stop), c.runFailEventsRead(processCtx, stop))
 
 	//FanOut
 	events, deads, brokens := c.runConvertAndSplit(in)
