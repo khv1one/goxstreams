@@ -11,6 +11,7 @@ import (
 // RedisClient required to use cluster client
 type RedisClient interface {
 	redis.StreamCmdable
+	redis.Cmdable
 }
 type streamClient struct {
 	client        RedisClient
@@ -104,6 +105,19 @@ func (c streamClient) add(
 	ctx context.Context, stream string, event map[string]interface{},
 ) error {
 	_, err := c.client.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: event}).Result()
+
+	return err
+}
+
+func (c streamClient) addBatch(
+	ctx context.Context, stream string, events []map[string]interface{},
+) error {
+	_, err := c.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, event := range events {
+			pipe.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: event})
+		}
+		return nil
+	})
 
 	return err
 }
@@ -228,7 +242,6 @@ func (c streamClient) xStreamToXRawMessage(streams []redis.XStream) *[]xRawMessa
 func (c streamClient) xStreamToXRawMessageRetries(
 	events []redis.XMessage, pendingCountByID map[string]int64,
 ) *[]xRawMessage {
-	//result := make([]xRawMessage, 0, len(pendingsIds))
 	ptr := c.eventPool.xMessageGet()
 	buf := *ptr
 	for _, event := range events {
