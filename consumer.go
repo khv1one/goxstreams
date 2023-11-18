@@ -212,11 +212,11 @@ func (c Consumer[E]) runConvertAndSplit(
 			}
 
 			if event.RetryCount > c.config.MaxRetries {
-				outDeads <- newRedisMessage(event.ID, event.RetryCount, convertedEvent)
+				outDeads <- newRedisMessage(event.ID, event.RetryCount, *convertedEvent)
 				continue
 			}
 
-			outEvents <- newRedisMessage(event.ID, event.RetryCount, convertedEvent)
+			outEvents <- newRedisMessage(event.ID, event.RetryCount, *convertedEvent)
 		}
 
 		return
@@ -382,13 +382,13 @@ func (c Consumer[E]) runFinishingBatching(
 	}()
 }
 
-func (c Consumer[E]) convertEvent(raw xRawMessage) (E, error) {
+func (c Consumer[E]) convertEvent(raw xRawMessage) (*E, error) {
 	convertedEvent, err := c.convertTo(raw.Values)
 	if err != nil {
-		return *convertedEvent, err
+		return convertedEvent, err
 	}
 
-	return *convertedEvent, nil
+	return convertedEvent, nil
 }
 
 func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted, wg *sync.WaitGroup) {
