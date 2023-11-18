@@ -29,6 +29,16 @@ func NewProducerWithConverter[E any](client RedisClient, convertFrom func(event 
 	return producer
 }
 
+// SetConverter is a Producer's method for custom data converting.
+//
+// Since Redis Streams messages are limited to a flat structure, we have 2 options available:
+//   - flat Example: ("foo_key", "foo_val", "bar_key", "bar_val");
+//   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
+//   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
+func (p Producer[E]) SetConverter(convertFrom func(event *E) (map[string]interface{}, error)) {
+	p.convertFrom = convertFrom
+}
+
 // Produce method for push message to redis stream.
 //
 // With default converter, redis message will be like:

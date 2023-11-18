@@ -72,6 +72,16 @@ func NewConsumerWithConverter[E any](
 	return consumer, err
 }
 
+// SetConverter is a Consumer's method for custom data converting.
+//
+// Since Redis Streams messages are limited to a flat structure, we have 2 options available:
+//   - flat Example: ("foo_key", "foo_val", "bar_key", "bar_val");
+//   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
+//   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
+func (c Consumer[E]) SetConverter(convertTo func(event map[string]interface{}) (*E, error)) {
+	c.convertTo = convertTo
+}
+
 // Run is a method to start processing messages from redis stream.
 //
 // This method will start two processes: xreadgroup and xpending + xclaim.
