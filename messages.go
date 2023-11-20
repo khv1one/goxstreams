@@ -1,5 +1,7 @@
 package goxstreams
 
+import "context"
+
 // RedisMessage transmite to Worker.Process and Worker.ProcessDead method. Contains eventbody and addititional info.
 type RedisMessage[E any] struct {
 	ID         string
@@ -23,6 +25,16 @@ func newRedisBrokenMessage(id string, retryCount int64, message map[string]inter
 	return RedisBrokenMessage{id, int(retryCount), message, err}
 }
 
+type redisMessageCtx[E any] struct {
+	ctx  context.Context
+	body RedisMessage[E]
+}
+
+type redisBrokenMessageCtx struct {
+	ctx  context.Context
+	body RedisBrokenMessage
+}
+
 type xRawMessage struct {
 	ID         string
 	RetryCount int64
@@ -30,5 +42,5 @@ type xRawMessage struct {
 }
 
 func newXMessage(id string, retryCount int64, body map[string]interface{}) xRawMessage {
-	return xRawMessage{id, retryCount, body}
+	return xRawMessage{ID: id, RetryCount: retryCount, Values: body}
 }

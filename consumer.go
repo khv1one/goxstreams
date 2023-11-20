@@ -19,11 +19,12 @@ type Worker[E any] interface {
 
 // Consumer is a wrapper to easily getting messages from redis stream.
 type Consumer[E any] struct {
-	client    streamClient
-	worker    Worker[E]
-	errorLog  logger
-	config    ConsumerConfig
-	convertTo func(event map[string]interface{}) (*E, error)
+	client     streamClient
+	worker     Worker[E]
+	errorLog   logger
+	config     ConsumerConfig
+	convertTo  func(event map[string]interface{}) (*E, error)
+	receiveCtx func(ctx context.Context, event map[string]interface{}) context.Context
 }
 
 // NewConsumer is a constructor Consumer struct.
@@ -53,33 +54,29 @@ func NewConsumer[E any](
 	return consumer, err
 }
 
-// NewConsumerWithConverter is a constructor Consumer struct with custom convert.
+// WithConverter is a Consumer's method for custom data converting.
 //
 // Since Redis Streams messages are limited to a flat structure, we have 2 options available:
 //   - flat Example: ("foo_key", "foo_val", "bar_key", "bar_val");
 //   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
 //   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
-func NewConsumerWithConverter[E any](
-	ctx context.Context,
-	client RedisClient,
-	worker Worker[E],
+func (c Consumer[E]) WithConverter(
 	convertTo func(event map[string]interface{}) (*E, error),
-	config ConsumerConfig,
-) (Consumer[E], error) {
-	consumer, err := NewConsumer(ctx, client, worker, config)
-	consumer.convertTo = convertTo
+) Consumer[E] {
+	c.convertTo = convertTo
 
-	return consumer, err
+	return c
 }
 
-// SetConverter is a Consumer's method for custom data converting.
+// WithCtxReceiver is a method for receiving context fields
 //
-// Since Redis Streams messages are limited to a flat structure, we have 2 options available:
-//   - flat Example: ("foo_key", "foo_val", "bar_key", "bar_val");
-//   - nested json or proto into one key ("key", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
-//   - or combination ("foo_key", "foo_val", "foobar", "{"foobar": {"foo_key": "foo_val", "bar_key": "bar_val"}}")
-func (c Consumer[E]) SetConverter(convertTo func(event map[string]interface{}) (*E, error)) {
-	c.convertTo = convertTo
+// Looks like "ctx_field" "{"any_info":"info", "trace_id": "my_trace_id"}" in redis event
+func (c Consumer[E]) WithCtxReceiver(
+	receiveCtx func(ctx context.Context, event map[string]interface{}) context.Context,
+) Consumer[E] {
+	c.receiveCtx = receiveCtx
+
+	return c
 }
 
 // Run is a method to start processing messages from redis stream.
@@ -100,7 +97,7 @@ func (c Consumer[E]) Run(ctx context.Context) {
 	in := c.merge(c.runEventsRead(processCtx, stop), c.runFailEventsRead(processCtx, stop))
 
 	//FanOut
-	events, deads, brokens := c.runConvertAndSplit(in)
+	events, deads, brokens := c.runConvertAndSplit(ctx, in)
 
 	ackChan, delChan := c.runProccessing(processCtx, events, deads, brokens)
 	c.runFinishingBatching(processCtx, ackChan, c.client.ack)
@@ -109,6 +106,7 @@ func (c Consumer[E]) Run(ctx context.Context) {
 
 func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-chan xRawMessage {
 	out := make(chan xRawMessage)
+
 	go func() {
 		for {
 			select {
@@ -128,8 +126,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 					continue
 				}
 
-				events := *eventsPtr
-				for _, event := range events {
+				for _, event := range *eventsPtr {
 					out <- event
 				}
 
@@ -165,8 +162,7 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}
 					continue
 				}
 
-				events := *eventsPtr
-				for _, event := range events {
+				for _, event := range *eventsPtr {
 					out <- event
 				}
 				c.client.eventPool.xMessagePut(eventsPtr)
@@ -181,14 +177,15 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}
 
 func (c Consumer[E]) merge(cs ...<-chan xRawMessage) <-chan xRawMessage {
 	var wg sync.WaitGroup
-	out := make(chan xRawMessage)
 	wg.Add(len(cs))
 
+	out := make(chan xRawMessage)
 	for _, channel := range cs {
 		go func(c <-chan xRawMessage) {
 			for n := range c {
 				out <- n
 			}
+
 			wg.Done()
 		}(channel)
 	}
@@ -197,15 +194,16 @@ func (c Consumer[E]) merge(cs ...<-chan xRawMessage) <-chan xRawMessage {
 		wg.Wait()
 		close(out)
 	}()
+
 	return out
 }
 
 func (c Consumer[E]) runConvertAndSplit(
-	in <-chan xRawMessage,
-) (<-chan RedisMessage[E], <-chan RedisMessage[E], <-chan RedisBrokenMessage) {
-	outEvents := make(chan RedisMessage[E])
-	outDeads := make(chan RedisMessage[E])
-	outBrokens := make(chan RedisBrokenMessage)
+	ctx context.Context, in <-chan xRawMessage,
+) (<-chan redisMessageCtx[E], <-chan redisMessageCtx[E], <-chan redisBrokenMessageCtx) {
+	outEvents := make(chan redisMessageCtx[E])
+	outDeads := make(chan redisMessageCtx[E])
+	outBrokens := make(chan redisBrokenMessageCtx)
 
 	toChannels := func() {
 		defer func() {
@@ -215,21 +213,35 @@ func (c Consumer[E]) runConvertAndSplit(
 		}()
 
 		for event := range in {
+			messageCtx := context.WithoutCancel(ctx)
+			if c.receiveCtx != nil {
+				messageCtx = c.receiveCtx(messageCtx, event.Values)
+			}
+
 			convertedEvent, err := c.convertEvent(event)
 			if err != nil {
-				outBrokens <- newRedisBrokenMessage(event.ID, event.RetryCount, event.Values, err)
+				outBrokens <- redisBrokenMessageCtx{
+					messageCtx,
+					newRedisBrokenMessage(event.ID, event.RetryCount, event.Values, err),
+				}
+
 				continue
 			}
 
 			if event.RetryCount > c.config.MaxRetries {
-				outDeads <- newRedisMessage(event.ID, event.RetryCount, *convertedEvent)
+				outDeads <- redisMessageCtx[E]{
+					messageCtx,
+					newRedisMessage(event.ID, event.RetryCount, *convertedEvent),
+				}
+
 				continue
 			}
 
-			outEvents <- newRedisMessage(event.ID, event.RetryCount, *convertedEvent)
+			outEvents <- redisMessageCtx[E]{
+				messageCtx,
+				newRedisMessage(event.ID, event.RetryCount, *convertedEvent),
+			}
 		}
-
-		return
 	}
 
 	go toChannels()
@@ -238,46 +250,48 @@ func (c Consumer[E]) runConvertAndSplit(
 }
 
 func (c Consumer[E]) runProccessing(
-	ctx context.Context, stream, deadStream <-chan RedisMessage[E], brokenStream <-chan RedisBrokenMessage,
+	ctx context.Context, stream, deadStream <-chan redisMessageCtx[E], brokenStream <-chan redisBrokenMessageCtx,
 ) (<-chan string, <-chan string) {
+	var inChannelsWg sync.WaitGroup
+	inChannelsWg.Add(3)
+
+	var processingWg sync.WaitGroup
+
+	sem := semaphore.NewWeighted(c.config.MaxConcurrency)
+
 	ackChan := make(chan string, c.config.MaxConcurrency)
 	delChan := make(chan string, c.config.MaxConcurrency)
 
-	sem := semaphore.NewWeighted(c.config.MaxConcurrency)
-	var processesWg sync.WaitGroup
-	processesWg.Add(3)
-	var taleWg sync.WaitGroup
-
 	go func() {
 		for message := range stream {
-			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processEvent(context.WithoutCancel(ctx), message, sem, &taleWg, ackChan, delChan)
+			c.safeAcquire(ctx, sem, &processingWg)
+			go c.processEvent(message.ctx, message.body, sem, &processingWg, ackChan, delChan)
 		}
 
-		processesWg.Done()
+		inChannelsWg.Done()
 	}()
 
 	go func() {
 		for message := range brokenStream {
-			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processBroken(context.WithoutCancel(ctx), message, sem, &taleWg, delChan)
+			c.safeAcquire(ctx, sem, &processingWg)
+			go c.processBroken(context.WithoutCancel(ctx), message.body, sem, &processingWg, delChan)
 		}
 
-		processesWg.Done()
+		inChannelsWg.Done()
 	}()
 
 	go func() {
 		for message := range deadStream {
-			c.safeAcquire(ctx, sem, &taleWg)
-			go c.processDead(context.WithoutCancel(ctx), message, sem, &taleWg, delChan)
+			c.safeAcquire(ctx, sem, &processingWg)
+			go c.processDead(message.ctx, message.body, sem, &processingWg, delChan)
 		}
 
-		processesWg.Done()
+		inChannelsWg.Done()
 	}()
 
 	go func() {
-		processesWg.Wait()
-		taleWg.Wait()
+		inChannelsWg.Wait()
+		processingWg.Wait()
 		close(ackChan)
 		close(delChan)
 	}()
@@ -404,6 +418,7 @@ func (c Consumer[E]) convertEvent(raw xRawMessage) (*E, error) {
 func (c Consumer[E]) safeAcquire(ctx context.Context, sem *semaphore.Weighted, wg *sync.WaitGroup) {
 	wg.Add(1)
 	err := sem.Acquire(ctx, 1)
+
 	if err != nil {
 		c.errorLog.fatal(fmt.Sprintf("can`t acquire semaphore: %v\n", err))
 	}
