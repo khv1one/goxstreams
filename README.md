@@ -475,8 +475,8 @@ import (
 )
 
 func (w Worker[E]) Process(ctx context.Context, event goxstreams.RedisMessage[E]) error {
-    fmt.Printf("success, retries %d, trace_id: %s, tenant: %s\n",
-        event.RetryCount, ctx.Value("trace_id"), ctx.Value("tenant"))
+    fmt.Printf("success, retries %d, trace_id: %s, any_info: %s\n",
+        event.RetryCount, ctx.Value("trace_id"), ctx.Value("any_info"))
 
     return nil
 }
