@@ -130,7 +130,7 @@ func (c Consumer[E]) runEventsRead(ctx context.Context, stop <-chan struct{}) <-
 					out <- event
 				}
 
-				c.client.eventPool.xMessagePut(eventsPtr)
+				c.client.xMessageSliceToPool(eventsPtr)
 			}
 		}
 	}()
@@ -165,7 +165,7 @@ func (c Consumer[E]) runFailEventsRead(ctx context.Context, stop <-chan struct{}
 				for _, event := range *eventsPtr {
 					out <- event
 				}
-				c.client.eventPool.xMessagePut(eventsPtr)
+				c.client.xMessageSliceToPool(eventsPtr)
 
 				<-ticker.C
 			}

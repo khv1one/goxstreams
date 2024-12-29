@@ -10,9 +10,18 @@ import (
 
 // RedisClient required to use cluster client
 type RedisClient interface {
-	redis.StreamCmdable
-	redis.Cmdable
+	Pipelined(ctx context.Context, fn func(redis.Pipeliner) error) ([]redis.Cmder, error)
+	XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd
+	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
+	XDel(ctx context.Context, stream string, ids ...string) *redis.IntCmd
+	XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *redis.XStreamSliceCmd
+	XClaim(ctx context.Context, a *redis.XClaimArgs) *redis.XMessageSliceCmd
+	XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd
+	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
+	XGroupCreate(ctx context.Context, stream, group, start string) *redis.StatusCmd
+	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
 }
+
 type streamClient struct {
 	client        RedisClient
 	groupReadArgs *redis.XReadGroupArgs
@@ -250,4 +259,8 @@ func (c streamClient) xStreamToXRawMessageRetries(
 	ptr = &buf
 
 	return ptr
+}
+
+func (c streamClient) xMessageSliceToPool(slicePtr *[]xRawMessage) {
+	c.eventPool.xMessagePut(slicePtr)
 }
