@@ -20,7 +20,7 @@ import "time"
 //
 //	CleaneUp: (optional) automatic deletion of messages after successful processing
 //
-//	FailReadTime: (optional) Failed messages read interval
+//	ReadInterval: (optional) Messages read interval
 //
 //	FailIdle: (optional) The time after which the message will be considered corrupted
 //
